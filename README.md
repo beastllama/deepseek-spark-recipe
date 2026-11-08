@@ -47,6 +47,9 @@ Two independently reviewed draft PRs port the narrow fixes to the current `deeps
 - [#55: Scope ContextFull admission backoff to the refused request](https://github.com/bertholomus/TensorFold/pull/55)
 
 Each includes a failing CPU regression and focused passing controls. Their full native-build/GPU qualification is pending and the draft bodies record local build limitations. The complete tested-stack overlay here already contains the original local versions of both repairs. The two PRs are separate ports to a newer upstream source; applying them alone does not recreate this measured image.
+
+The latest independent-backing repair is submitted separately as [draft #56: retain complete packed prefix backing in prompt snapshots](https://github.com/bertholomus/TensorFold/pull/56). That public-API adaptation passes its overwrite regression, focused CPU controls and full-family semantic compilation; native-build/GPU qualification remains pending. The v0.2 ordered patches here reproduce the locally measured source; the separate public port is not itself qualified by those private-deployment measurements.
+
 ## External assets
 
 Acquire assets from their authors under their own terms. Reuse an existing verified preparation where available. Asset preparation can download hundreds of GB and write large packed ranks; it is separate from a normal model start.
