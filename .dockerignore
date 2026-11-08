@@ -1,0 +1,4 @@
+*
+!tensorfold/
+!tensorfold/**
+tensorfold/.git

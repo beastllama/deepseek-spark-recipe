@@ -1,0 +1,28 @@
+{
+  "checked_date": "2026-11-07",
+  "checks": [
+    {
+      "repository": "Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw",
+      "revision": "45ee5d0fd106c94a3d77f721e09cbb2f50e5a16b",
+      "metadata_url": "https://huggingface.co/api/models/Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw/revision/45ee5d0fd106c94a3d77f721e09cbb2f50e5a16b",
+      "declared_license": "mit",
+      "gated": false
+    },
+    {
+      "repository": "drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated",
+      "revision": "de412d2249632903dace23399526e00a145aada5",
+      "metadata_url": "https://huggingface.co/api/models/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated/revision/de412d2249632903dace23399526e00a145aada5",
+      "declared_license": "mit",
+      "gated": "auto"
+    },
+    {
+      "repository": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+      "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+      "metadata_url": "https://huggingface.co/api/models/deepseek-ai/DeepSeek-V4.1-Flash-1017/revision/1bae0e1088993b9b82de08f59de5be5a34e42170",
+      "declared_license": "mit",
+      "gated": false
+    }
+  ],
+  "keys_separate_license_url_status": 404,
+  "interpretation": "Metadata declarations and access state only; no model or Keys redistribution is made."
+}

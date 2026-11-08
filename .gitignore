@@ -1,0 +1,8 @@
+/tensorfold/
+/runtime.env
+/assets/
+/cubins/
+/build/
+*.tar
+*.tar.gz
+__pycache__/

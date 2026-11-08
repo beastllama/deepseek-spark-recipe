@@ -1,0 +1,56 @@
+{
+  "status": "PASS",
+  "base_image": "sha256:03e0b6a1a50798fb23cda4901767db7626e75b138608133d7e84d67e761f145c",
+  "source_manifest_sha256": "854422b075222c561421a646e2598355f801a1419732ddab51eba067be6afe2e",
+  "selected_source_manifest_sha256": "3822c5e83a76fc73499e6bf80b22d88945c0ca879c679ebf6dc81bb16ebca3c5",
+  "source_files": 1117,
+  "source_tree_sha256": "4df32ee4fc221d4e773542005750fd4fa411deed331ab2d8218fab5785eb85ce",
+  "parent_binaries_sha256": {
+    "head": "94ce36453e4783d4b1dbabb16e40377cb0be7930d9c373fc44f00fec192c6d1c",
+    "follower": "2f0a3bc9cec2947267b5dda0109092d9e6e82d2ca189a6014224f4e08b17d4ed"
+  },
+  "output_sha256": {
+    "head": "689f0b357869ebb5a2aee82f164f5d47a3199bf65fed40e7aef8f4d1e7b24f5c",
+    "follower": "98af3685b6b0dec5c9d22b36196f8b6aa9950ce4cf842394dca3d2334468b5f9"
+  },
+  "output_architecture": {
+    "head": "ELF64 little-endian AArch64 (183)",
+    "follower": "ELF64 little-endian AArch64 (183)"
+  },
+  "embedded_fatbins": {
+    "head": [
+      "dsv41_ops.fatbin",
+      "dsv41_rdma.fatbin",
+      "dsv41_torch.fatbin",
+      "experts.fatbin",
+      "experts_pack.fatbin",
+      "experts_prefill.fatbin",
+      "lane_gemv.fatbin",
+      "nemotron_ops.fatbin",
+      "prefill_attention.fatbin",
+      "qmm_group.fatbin",
+      "qmm_prefill.fatbin",
+      "sample.fatbin",
+      "scan_rows.fatbin",
+      "torch_argmax.fatbin",
+      "torch_indexing.fatbin",
+      "torch_movement.fatbin",
+      "torch_nemotron_constants.fatbin",
+      "torch_pointwise.fatbin",
+      "torch_topk.fatbin"
+    ],
+    "follower": [
+      "dsv41_ops.fatbin",
+      "dsv41_rdma.fatbin",
+      "dsv41_torch.fatbin",
+      "torch_movement.fatbin",
+      "torch_pointwise.fatbin"
+    ]
+  },
+  "compile_exit": 0,
+  "compile_log_sha256": "f59dcc94a98f80f27d9e41693b0b0ea11d6f0a92ebf8058668744a14d1fc0d00",
+  "model_actions": 0,
+  "publication_clean_rebuild_performed": false,
+  "runtime_image": "sha256:dac7945c079d491bb1f757f2a9b376abd55f80e59835d303333eac192cb85a25",
+  "base_source_revision": "fbbc97132cd004237d9887b8d3185896efaedc5c"
+}

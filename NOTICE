@@ -1,0 +1,23 @@
+DeepSeek on two DGX Sparks: measured stack and reproduction recipe
+
+This publication contains a patch to TensorFold source and reproduction notes.
+The patch is relative to fbbc97132cd004237d9887b8d3185896efaedc5c and includes
+retained source changes plus the November 7, 2026 admission/cache repairs.
+patches/MODIFICATIONS.md identifies each changed source file. The original
+authors' attribution and license notices remain applicable.
+
+TensorFold
+Copyright 2026 TensorFold contributors
+https://github.com/ashhart/TensorFold
+
+The engine and retained adaptations include work from BertholomusAI and
+MiaAI-Lab's DeepSeek Spark recipe and its contributors. Their complete notices
+are reproduced in LICENSES/TensorFold-NOTICE,
+LICENSES/TensorFold-THIRD_PARTY_NOTICES.md and LICENSES/MiaAI-Lab-NOTICE.
+LICENSES/MiaAI-Lab-CREDITS.md preserves the pinned recipe's attribution inventory.
+
+The new reproduction notes and native-argv adapter are distributed under
+Apache-2.0, alongside the engine patch. This publication does not relicense
+third-party work. Model weights, Keys, Engram, kernel kits, compiled GPU bundles,
+containers and NVIDIA components are not redistributed here and retain their
+authors' own terms.

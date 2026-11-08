@@ -1,0 +1,9 @@
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+Dockerfile text eol=lf
+# Preserve the exact reconstruction patch; diff context includes required single-space lines.
+patches/*.patch -text whitespace=-blank-at-eol,-blank-at-eof
+# Retain the imported helper's original final blank line.
+scripts/stage_aot.py text eol=lf whitespace=-blank-at-eof
+*.png binary

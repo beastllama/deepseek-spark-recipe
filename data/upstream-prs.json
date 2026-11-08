@@ -1,0 +1,14 @@
+{
+  "cache": {
+    "draft": true,
+    "commit": "79c5aa63ec4e93f624f503860263d3108476bc43",
+    "url": "https://github.com/bertholomus/TensorFold/pull/54"
+  },
+  "admission": {
+    "draft": true,
+    "commit": "b387b5255c38f094649f3fa2774d395c3750ab55",
+    "url": "https://github.com/bertholomus/TensorFold/pull/55"
+  },
+  "base": "e100ee8b1d806a9f516d7a01cbcbf06ae98d77e1",
+  "independent_review": "No remaining blocking findings; CPU regressions/controls reviewed; native build and GPU qualification limits retained"
+}

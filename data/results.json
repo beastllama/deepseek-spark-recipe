@@ -1,0 +1,71 @@
+{
+  "date_central": "2026-11-07",
+  "surface": "SparkDash UI",
+  "hardware": {
+    "dgx_sparks": 2,
+    "tensor_parallel": 2
+  },
+  "deployment": {
+    "weights": "abliterated EAQ v1 + matching Keys",
+    "shared_context_tokens": 524288,
+    "admitted_lanes": 8,
+    "internal_streams": 32,
+    "prefix_cache_gib": 1,
+    "source_manifest": "854422b075222c561421a646e2598355f801a1419732ddab51eba067be6afe2e",
+    "image": "sha256:dac7945c079d491bb1f757f2a9b376abd55f80e59835d303333eac192cb85a25"
+  },
+  "prefill": {
+    "job_id": "54a3b8af-70a4-4543-bd5d-2d4fd75da278",
+    "target_tokens": 131072,
+    "actual_prompt_tokens_per_sample": 131094,
+    "measured_samples": 2,
+    "failed_samples": 0,
+    "cached_tokens_per_sample": [
+      0,
+      0
+    ],
+    "displayed_prefill_tps": 2232.53,
+    "raw_ttft_ms": 58898.28,
+    "overhead_ms": 178.34,
+    "method": "ttft",
+    "selection": "lower-rate of two successful samples",
+    "temperature": 0,
+    "thinking": false,
+    "max_output_tokens": 8
+  },
+  "decode": {
+    "job_id": "cabfeab5-3401-4456-bcfa-8185f13a3969",
+    "requests": 8,
+    "passed": 8,
+    "failed": 0,
+    "prompt_tokens_per_request": 58,
+    "cached_tokens_per_request": 0,
+    "max_output_tokens": 400,
+    "completion_tokens_per_request": 400,
+    "finish_reason": "length",
+    "temperature": 0,
+    "thinking": true,
+    "top_k": 20,
+    "context_tokens_added": 0,
+    "aggregate_decode_tps": 311.1,
+    "mean_per_stream_decode_tps": 42.55,
+    "median_per_stream_decode_tps": 42.19,
+    "mean_first_token_ms": 924.45,
+    "mean_first_answer_token_ms": 2425.9225,
+    "measured_wave_duration_ms": 10466.45,
+    "min_per_stream_decode_tps": 39.79,
+    "max_per_stream_decode_tps": 45.41
+  },
+  "control": {
+    "persistent_settings_changed": false,
+    "restarts": 0,
+    "oom": false,
+    "graph_fallbacks": 0,
+    "preemptions": 0,
+    "foreign_completions_observed": 0,
+    "prompt_counter_delta": 267504,
+    "native_prompt_sum": 267504,
+    "model_cache_flush": false,
+    "os_cache_flush": false
+  }
+}
