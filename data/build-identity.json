@@ -1,21 +1,23 @@
 {
   "status": "PASS",
-  "base_image": "sha256:03e0b6a1a50798fb23cda4901767db7626e75b138608133d7e84d67e761f145c",
-  "source_manifest_sha256": "854422b075222c561421a646e2598355f801a1419732ddab51eba067be6afe2e",
-  "selected_source_manifest_sha256": "3822c5e83a76fc73499e6bf80b22d88945c0ca879c679ebf6dc81bb16ebca3c5",
+  "base_image": "sha256:413dfa4fcbe544b1c2d7718c911e34c5a6c08c9f6263f83b1c2a3015033f0b84",
   "source_files": 1117,
-  "source_tree_sha256": "4df32ee4fc221d4e773542005750fd4fa411deed331ab2d8218fab5785eb85ce",
+  "source_tree_sha256": "e6581809b03c00c99f79f090ee4891dda0f3ee1b7bbb0159b78f8d2454a80b8c",
+  "preimages_sha256": {
+    "zig/src/families/dsv41/lanes.zig": "3504a0a002a0004bbb9909f118acab5282d66593bcd90f8326507eb262d32f53",
+    "zig/src/families/dsv41/model.zig": "1b35574c2bc8c0fc18d6fb0ae30c87bf1f661b58c82c6c8dda51e30a1e4da015"
+  },
+  "postimages_sha256": {
+    "zig/src/families/dsv41/model.zig": "aedc0bb3dcc1d4429617b249016a1b0fb3f5727f771cbd83fd89658e96e344ad",
+    "zig/src/families/dsv41/lanes.zig": "0c5f845b9452b84811d5d406206aa571d8deaafdf30897530e729524ac21e541"
+  },
   "parent_binaries_sha256": {
-    "head": "94ce36453e4783d4b1dbabb16e40377cb0be7930d9c373fc44f00fec192c6d1c",
-    "follower": "2f0a3bc9cec2947267b5dda0109092d9e6e82d2ca189a6014224f4e08b17d4ed"
+    "head": "1c048bc0c957f6fed11f03c19968a1a209a0970996b9f1d5ac235496d6de9a36",
+    "follower": "6011c7e5e053fa2faa594f2b57426f1e8edf2f54e317ae0b23b82c354e73feb8"
   },
   "output_sha256": {
-    "head": "689f0b357869ebb5a2aee82f164f5d47a3199bf65fed40e7aef8f4d1e7b24f5c",
-    "follower": "98af3685b6b0dec5c9d22b36196f8b6aa9950ce4cf842394dca3d2334468b5f9"
-  },
-  "output_architecture": {
-    "head": "ELF64 little-endian AArch64 (183)",
-    "follower": "ELF64 little-endian AArch64 (183)"
+    "head": "3b90211d330cab6ea2740464810ca2f38dec80d12a412bc14451f8f7b4a0b3d4",
+    "follower": "d4de09e5e28ecf659bd2894eff2c0b4f1abf93b8c679a617423b98c4457a0937"
   },
   "embedded_fatbins": {
     "head": [
@@ -47,10 +49,22 @@
       "torch_pointwise.fatbin"
     ]
   },
+  "output_architecture": {
+    "head": "ELF64 little-endian AArch64 (183)",
+    "follower": "ELF64 little-endian AArch64 (183)"
+  },
+  "follower_binary_changed": true,
   "compile_exit": 0,
-  "compile_log_sha256": "f59dcc94a98f80f27d9e41693b0b0ea11d6f0a92ebf8058668744a14d1fc0d00",
-  "model_actions": 0,
+  "compile_jobs": 1,
+  "build_recipe": "native-build-02",
+  "compile_log_sha256": "2287f246efdc2ac24841a3969e47f10c10765ad900ae951bf4a46d203aa74bb2",
+  "recipe_version": "v0.2-source-preview",
+  "runtime_image": "sha256:efceb406655ba9e7334e77f6ed0ff4511ac1d0ec7c471f2d66a70e766aedc0ba",
+  "base_source_revision": "fbbc97132cd004237d9887b8d3185896efaedc5c",
+  "compiler_sha256": "5165c9a2d17938a8173839b3adf81d025b558d38d9e9711237a6fa5b8d8bb3f7",
   "publication_clean_rebuild_performed": false,
-  "runtime_image": "sha256:dac7945c079d491bb1f757f2a9b376abd55f80e59835d303333eac192cb85a25",
-  "base_source_revision": "fbbc97132cd004237d9887b8d3185896efaedc5c"
+  "retained_gpu_bundles": true,
+  "both_peer_executables_required": true,
+  "prior_speed_results": "build-identity-v0.1.json",
+  "native_build_input_manifest_sha256": "27a18ccda3a144433ebe746ee5080c06e69329ea14d8e2db9c5c8f50c14a8971"
 }

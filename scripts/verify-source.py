@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the exact native source closure recorded for the November 7 results."""
+"""Verify the recorded native source closure (v0.2 by default)."""
 import argparse
 import hashlib
 import json
@@ -9,8 +9,10 @@ from pathlib import Path
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("source", type=Path)
+    cli.add_argument("--manifest", type=Path,
+                     help="Use an explicit historical source manifest")
     args = cli.parse_args()
-    manifest_path = Path(__file__).resolve().parents[1] / "data" / "source-manifest.json"
+    manifest_path = args.manifest or Path(__file__).resolve().parents[1] / "data" / "source-manifest.json"
     expected = json.loads(manifest_path.read_text())
     actual = {}
     for name, wanted in expected["manifest"].items():

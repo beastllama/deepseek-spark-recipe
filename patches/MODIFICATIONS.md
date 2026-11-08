@@ -1,6 +1,10 @@
 # Source modification inventory
 
-The patch distributes modifications to Apache-2.0 TensorFold source at the pinned public revision. Each diff section identifies its modified file. The exact tested source bytes are preserved for hash verification. These changes combine prior retained work with the November 7 repairs; they are not presented as two isolated new changes. Retain the base source notices when applying or redistributing it.
+The ordered patches distribute modifications to Apache-2.0 TensorFold source at the pinned public revision. Each diff section identifies its modified file. The exact tested source bytes are preserved for hash verification. These changes combine prior retained work with the November 7 repairs; they are not presented as isolated new changes. Retain the base source notices when applying or redistributing them.
+
+Apply `tested-stack.patch`, `cache-cut-in.patch`, then `full-prefix-backing.patch`. The last two touch only `lanes.zig` and `model.zig`, already present in the inventory below, so the total remains 53 modified files and seven additions. The guard refuses unsafe cached cut-ins before placement; complete backing then preserves the packed prefix independently of reusable working rows and updates both peers' save/restore protocol. Both executables must come from the same updated build.
+
+[patch-series.json](../data/patch-series.json) records patch hashes, exact preimages/postimages and intermediate closure digests. [source-modifications.json](../data/source-modifications.json) records each final v0.2 hash relative to the public base. Historical v0.1 closure/build identity are retained separately; its original patch is unchanged.
 
 | Change | File |
 | --- | --- |

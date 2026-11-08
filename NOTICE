@@ -1,8 +1,8 @@
 DeepSeek on two DGX Sparks: measured stack and reproduction recipe
 
-This publication contains a patch to TensorFold source and reproduction notes.
-The patch is relative to fbbc97132cd004237d9887b8d3185896efaedc5c and includes
-retained source changes plus the November 7, 2026 admission/cache repairs.
+This publication contains ordered patches to TensorFold source and reproduction notes.
+The series is relative to fbbc97132cd004237d9887b8d3185896efaedc5c and includes
+retained source changes plus the November 7, 2026 admission/cache and full-prefix repairs.
 patches/MODIFICATIONS.md identifies each changed source file. The original
 authors' attribution and license notices remain applicable.
 

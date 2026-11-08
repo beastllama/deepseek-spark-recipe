@@ -1,0 +1,16 @@
+{
+  "date": "2026-11-07",
+  "patch_applies_to_public_pin": true,
+  "source_closure_files": 1117,
+  "source_closure_sha256": "4df32ee4fc221d4e773542005750fd4fa411deed331ab2d8218fab5785eb85ce",
+  "patch_sha256": "3da4edaff9df6dee1183b89ce644448a88715774adb5b342be13926453db073a",
+  "bash_syntax": "pass",
+  "python_syntax": "pass",
+  "json_parse": "pass",
+  "aot_extension_rows": "17-64",
+  "aot_extension_artifacts": 48,
+  "aot_extension_bytes": 18795792,
+  "private_host_path_and_token_pattern_scan": "pass",
+  "clean_publication_build_executed": false,
+  "model_actions": 0
+}

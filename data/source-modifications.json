@@ -153,7 +153,7 @@
     "path": "zig/src/families/dsv41/lanes.zig",
     "change": "modified",
     "base_sha256": "84ab9469613996041830762ea1cd249f15b48526869e399b7d6fcc2e183e8695",
-    "tested_sha256": "e067821838ca4824a821e71488623a1dca805b5f3d99a919abac2ec3ebf23e50"
+    "tested_sha256": "0c5f845b9452b84811d5d406206aa571d8deaafdf30897530e729524ac21e541"
   },
   {
     "path": "zig/src/families/dsv41/lanes_main.zig",
@@ -171,7 +171,7 @@
     "path": "zig/src/families/dsv41/model.zig",
     "change": "modified",
     "base_sha256": "c7efa403134723295d9e6b3331afbbbb5af39363a0a9fd9d54f241f52044cc7e",
-    "tested_sha256": "1b35574c2bc8c0fc18d6fb0ae30c87bf1f661b58c82c6c8dda51e30a1e4da015"
+    "tested_sha256": "aedc0bb3dcc1d4429617b249016a1b0fb3f5727f771cbd83fd89658e96e344ad"
   },
   {
     "path": "zig/src/families/dsv41/native.zig",

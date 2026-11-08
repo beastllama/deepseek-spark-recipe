@@ -1,0 +1,77 @@
+{
+  "date_central": "2026-11-07",
+  "surface": "Saved SparkDash UI jobs and numeric engine completion metadata",
+  "scope": "One matched paired long-history pressure sample",
+  "runtime_image_after": "sha256:efceb406655ba9e7334e77f6ed0ff4511ac1d0ec7c471f2d66a70e766aedc0ba",
+  "runtime_image_before": "sha256:413dfa4fcbe544b1c2d7718c911e34c5a6c08c9f6263f83b1c2a3015033f0b84",
+  "before_source_tree_sha256": "c3d01df87896197e3f67e1ba06cf85992987d05ed3f4cc4d72dc17594cf3da04",
+  "after_source_tree_sha256": "e6581809b03c00c99f79f090ee4891dda0f3ee1b7bbb0159b78f8d2454a80b8c",
+  "shared_settings": {
+    "weights": "abliterated EAQ v1 + matching Keys",
+    "shared_context_tokens": 524288,
+    "admitted_lanes": 8,
+    "snapshot_budget_mib": 1024,
+    "quality": "thinking on / High effort"
+  },
+  "requested_config": {
+    "task": "Structured counting",
+    "concurrency": 3,
+    "target_context_tokens": 170000,
+    "max_output_tokens": 400,
+    "temperature": 0.7,
+    "thinking": true,
+    "top_k": 20
+  },
+  "before": {
+    "actual_prompt_tokens_per_stream": 170041,
+    "successful_measured_streams": 3,
+    "completion_tokens_per_stream": 400,
+    "fully_reused_prefixes": 1,
+    "cached_tokens": 169856,
+    "prompt_tokens": 510123,
+    "mean_first_token_seconds": 83.041,
+    "measured_wave_seconds": 168.11,
+    "cold_priming_seconds": 235.73,
+    "whole_cold_job_seconds": 404.468
+  },
+  "after": {
+    "actual_prompt_tokens_per_stream": 170042,
+    "successful_measured_streams": 3,
+    "completion_tokens_per_stream": 400,
+    "fully_reused_prefixes": 3,
+    "cached_tokens": 509568,
+    "prompt_tokens": 510126,
+    "cached_tokens_per_stream": 169856,
+    "mean_first_token_seconds": 0.999,
+    "measured_wave_seconds": 6.747,
+    "cold_priming_seconds": 235.05,
+    "whole_cold_job_seconds": 242.435,
+    "last_snapshot_held_mib": 489,
+    "last_snapshot_states": 4,
+    "reported_budget_evictions": 0,
+    "reported_cache_refusals": 0,
+    "reported_cache_failures": 0
+  },
+  "derived": {
+    "measured_wave_time_reduction_percent": 95.99,
+    "whole_cold_job_time_reduction_percent": 40.06
+  },
+  "recall": {
+    "method": "Cold 32K recall, pressure overwrite, then warm 32K recall",
+    "cold_correct": 16,
+    "warm_correct": 16,
+    "questions": 16,
+    "stale_values": 0,
+    "completion_tokens_each": 116,
+    "same_output_fingerprint": true,
+    "warm_prompt_tokens": 36910,
+    "warm_cached_tokens": 36736
+  },
+  "limitations": [
+    "One paired sample with different random salts and stochastic output.",
+    "Actual prompt length differed by one token per stream.",
+    "Both intervals included a 32-token warmup; the baseline also included two unrelated tiny completions.",
+    "Recall checks test the 32K scenario, not broad semantic quality or 170K retrieval.",
+    "Whole-project completion gain and full output-reservation behavior are unmeasured."
+  ]
+}
