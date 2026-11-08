@@ -1,18 +1,20 @@
 # DeepSeek on two DGX Sparks: measured stack and reproduction recipe
 
-One November 7, 2026 SparkDash run completed eight short-prompt streams at **311.10 aggregate decode tokens/s**. A separate zero-prefix-reuse 128K run measured **2,232.53 tokens/s**, derived from calibrated first-token latency. [Results and limits](RESULTS.md) · [numeric data](data/results.json) · [credits](CREDITS.md) · [reproduction status](REPRODUCTION-STATUS.md).
+**v0.2 source preview, November 8, 2026:** complete prefix backing preserves reusable long histories after working KV rows are overwritten. In one matched three-stream 170K-context check, the measured follow-up wave fell from **168.110 s to 6.747 s**; including cold priming, the whole benchmark job took **40.06% less time**. Cold prefill was essentially unchanged. [Results and limits](RESULTS.md) · [pressure data](data/pressure-results.json) · [passive work data](data/live-work-results.json) · [credits](CREDITS.md) · [reproduction status](REPRODUCTION-STATUS.md).
 
-This repository publishes the source overlay, external asset references, launch settings and benchmark procedure for that selected deployment. It contains no model weights, Keys sidecar, Engram tables, packed ranks, GPU bundles, credentials or host controllers. A clean rebuild has **not** been executed for this publication. Source closure and the build/launch commands are verifiable; binary equivalence and an independent reproduction remain unverified.
+Historical v0.1 observations remain **311.10 aggregate decode tokens/s** across eight short-prompt streams and **2,232.53 tokens/s** for calibrated zero-prefix-reuse 128K prefill. Those jobs used image `dac7945c…`; they were not rerun on v0.2 image `efceb406…`. [Original numeric data](data/results.json).
+
+This repository publishes the ordered source overlays, external asset references, launch settings and benchmark procedures for these deployments. It contains no model weights, Keys sidecar, Engram tables, packed ranks, GPU bundles, credentials or host controllers. A clean rebuild has **not** been executed for this publication. Source closure and the build/launch commands are verifiable; binary equivalence and an independent reproduction remain unverified.
 
 ## What was measured
 
 Two NVIDIA DGX Sparks, TP=2, one rank per node, with local Engram on both nodes. The checkpoint was Mia EAQ **v1** 2.9 bpw with drowzeys' matching Keys sidecar. The deployment had a **524,288-token shared pool**, **8 admitted lanes**, **32 internal streams**, **64 round rows**, **1 GiB prompt cache**, native drafting/graphs, thinking on and High effort. Eight lanes do not mean eight independent 524K contexts. The speed job used 58-token inputs and a 400-token output cap.
 
-The measured image is identified in [build identity](data/build-identity.json). It was a local image, with no public pull URL. Its history includes retained cache/API/tool/Engram repairs, TP2 capacity work, completion-first scheduling, finer snapshots and planned Engram read-ahead, followed by two admission/cache repairs. Applying only the two focused upstream PRs to today's upstream does not recreate the measured runtime.
+The historical speed image is identified in [v0.1 build identity](data/build-identity-v0.1.json); the full-prefix runtime is identified in [v0.2 build identity](data/build-identity.json). Both were local images, with no public pull URL. Their history includes retained cache/API/tool/Engram repairs, TP2 capacity work, completion-first scheduling, finer snapshots and planned Engram read-ahead, followed by admission/cache repairs. Applying only the two focused upstream PRs to today's upstream does not recreate either runtime. v0.2 adds the refused-cut-in guard and complete independent prefix backing; it retains the same assets, quality settings, shared context, slots and 1 GiB snapshot budget.
 
 ## Saved SparkDash screenshots
 
-These are screenshots of the completed jobs, captured without rerunning them.
+These are historical v0.1 screenshots of the completed jobs, captured without rerunning them. They do not depict the new long-context pressure result.
 
 ![Eight concurrent decode streams: 311.1 aggregate tokens/s, 42.5 per stream, 8/8 successful](media/eight-user-decode.png)
 
@@ -26,10 +28,16 @@ git clone https://github.com/bertholomus/TensorFold.git tensorfold
 git -C tensorfold checkout --detach fbbc97132cd004237d9887b8d3185896efaedc5c
 git -C tensorfold apply --check ../patches/tested-stack.patch
 git -C tensorfold apply ../patches/tested-stack.patch
+git -C tensorfold apply --check ../patches/cache-cut-in.patch
+git -C tensorfold apply ../patches/cache-cut-in.patch
+git -C tensorfold apply --check ../patches/full-prefix-backing.patch
+git -C tensorfold apply ../patches/full-prefix-backing.patch
 python3 scripts/verify-source.py tensorfold
 ```
 
-The verifier checks every file in the recorded **1,117-file native build closure** against SHA-256 and its combined digest `4df32ee4fc221d4e773542005750fd4fa411deed331ab2d8218fab5785eb85ce`. The overlay modifies 53 existing files and adds seven. It preserves the exact tested bytes; the patch and [modification inventory](patches/MODIFICATIONS.md) identify the changed files. The base checkout's license and notices remain in place.
+The verifier checks every file in the recorded **1,117-file native build closure** against SHA-256 and its v0.2 digest `e6581809b03c00c99f79f090ee4891dda0f3ee1b7bbb0159b78f8d2454a80b8c`. Apply all three patches in that order. The [patch series](data/patch-series.json) records exact patch hashes, preimages, postimages and intermediate closures. The full-prefix patch alone does not apply to v0.1: `lanes.zig` needs the intervening cut-in guard. Together the overlays modify 53 existing files and add seven; [the inventory](patches/MODIFICATIONS.md) identifies them. The base checkout's license and notices remain in place.
+
+For historical v0.1 only, stop after `tested-stack.patch` and run `python3 scripts/verify-source.py tensorfold --manifest data/source-manifest-v0.1.json`; its closure remains `4df32ee4fc221d4e773542005750fd4fa411deed331ab2d8218fab5785eb85ce`. The old release and its measurements are preserved.
 
 ## Upstream bug fixes
 
@@ -39,6 +47,9 @@ Two independently reviewed draft PRs port the narrow fixes to the current `deeps
 - [#55: Scope ContextFull admission backoff to the refused request](https://github.com/bertholomus/TensorFold/pull/55)
 
 Each includes a failing CPU regression and focused passing controls. Their full native-build/GPU qualification is pending and the draft bodies record local build limitations. The complete tested-stack overlay here already contains the original local versions of both repairs. The two PRs are separate ports to a newer upstream source; applying them alone does not recreate this measured image.
+
+The latest independent-backing repair is submitted separately as [draft #56: retain complete packed prefix backing in prompt snapshots](https://github.com/bertholomus/TensorFold/pull/56). That public-API adaptation passes its overwrite regression, focused CPU controls and full-family semantic compilation; native-build/GPU qualification remains pending. The v0.2 ordered patches here reproduce the locally measured source; the separate public port is not itself qualified by those private-deployment measurements.
+
 ## External assets
 
 Acquire assets from their authors under their own terms. Reuse an existing verified preparation where available. Asset preparation can download hundreds of GB and write large packed ranks; it is separate from a normal model start.
@@ -88,13 +99,13 @@ The public source-build path uses ARM64 Linux, Zig 0.17.0, NVIDIA's PyTorch 26.0
 After source verification, on an ARM64 builder:
 
 ```sh
-docker build --tag local/deepseek-tested-source:2026-11-07 .
+docker build --tag local/deepseek-tested-source:v0.2-preview .
 ```
 
-[Dockerfile](Dockerfile) compiles the GPU bundles from public source and then builds both executables. It does not start the model. The original tested rebuild reused 21 existing fatbins and ran:
+[Dockerfile](Dockerfile) compiles the GPU bundles from public source and then builds both executables. It does not start the model. The saved v0.2 native rebuild passed using 21 retained GPU bundles and `-j1`; it was not a clean build of this public packaging. Its recorded command was:
 
 ```sh
-/opt/zig/zig build -Dfatbins=/fatbins -Doptimize=ReleaseFast -j2 \
+/opt/zig/zig build -Dfatbins=/fatbins -Doptimize=ReleaseFast -j1 \
   install native fatbins --summary all --prefix /work/candidate-runtime
 ```
 
@@ -102,7 +113,7 @@ docker build --tag local/deepseek-tested-source:2026-11-07 .
 
 ## Launch
 
-Use the two executables from the same build. Adapt [runtime.env.example](config/runtime.env.example) on each rank, with local Engram and the proper rank cache. The [launch adapter](scripts/launch-rank.sh) uses the recorded native CLI and settings. It launches a single rank inside your existing container/service integration and supplies no pair controller, watchdog or recovery policy.
+Use the two executables from the same updated build. **Both head and follower must be replaced together:** v0.2 changes peer snapshot save/restore messages, so this is not a head-only binary update. Adapt [runtime.env.example](config/runtime.env.example) on each rank, with local Engram and the proper rank cache. The [launch adapter](scripts/launch-rank.sh) uses the recorded native CLI and settings. It launches a single rank inside your existing container/service integration and supplies no pair controller, watchdog or recovery policy.
 
 Keep the normal memory and thermal guards from your supported recipe. The measured integration used Docker host networking/IPC, GPU access, `/dev/infiniband:rwm`, `IPC_LOCK`, unlimited memlock and a 64 MiB stack. Preserve those requirements and your own lifecycle ownership/stop behavior. The engine's 12.2 GiB allocation reserve is separate from the recipe's 2.5 GiB sustained/1 GiB emergency watchdog. Do not run a second pair over an existing one.
 
@@ -122,6 +133,8 @@ Save the model's source/asset/build pins and effective settings with both UI job
 1. **Prefill:** select only the 128K preset. Use the built-in unchanged warmup/calibration and two-sample protocol: temperature 0, thinking off, eight-token output cap. Record actual token counts and native cached tokens for each measured sample. The published result had 131,094 prompt tokens and cached=0 in both samples. Report calibrated TTFT-derived prefill and the UI's lower-rate-of-two selection; do not call this backend-only prefill or a median of three. Zero prefix reuse with a resident model is the meaning of cold here.
 2. **Decode:** choose exactly concurrency 8, Structured counting, Empty added context, output 400, temperature 0, top-k 20, thinking on. Record the full saved configuration; the deployment pool stays 524,288. Save aggregate and individual decode rates, first reasoning/content token, first answer token, completion counts and finish reasons. The published eight requests all reached `length`, so this is a capped speed observation.
 3. **Record boundaries:** verify native cached=0, identify any unrelated completions, and record request errors, restarts, OOM, graph fallbacks and preemptions. Restore any temporary UI control change after the jobs. Do not run an extra standalone generator to duplicate the UI checks.
+
+The separate v0.2 pressure protocol uses Structured/3/170000/400, temperature 0.7, top-k 20 and thinking on, with a cold 32K recall check before pressure and a warm recall check afterward. Save cold-primer, measured-wave and whole-job times separately, native prompt/cache counts and overwrite/budget evidence. [RESULTS.md](RESULTS.md) describes the saved paired comparison, salt difference and limits. Passive all-client reuse observations are a separate evidence source.
 
 SparkDash here included local dashboard overlays. The exact collector source binding is still a documented reproduction limitation; UI labels alone are not a version pin. Use [RESULTS.md](RESULTS.md) to keep the metric definitions explicit.
 

@@ -1,0 +1,63 @@
+{
+  "date_utc": "2026-11-08",
+  "scope": "Passive all-client model completions after repair verification; not completed projects",
+  "runtime_image": "sha256:efceb406655ba9e7334e77f6ed0ff4511ac1d0ec7c471f2d66a70e766aedc0ba",
+  "sample_times_utc": [
+    "2026-11-08T05:56:38Z",
+    "2026-11-08T05:57:27Z"
+  ],
+  "samples": [
+    {
+      "completed_model_steps": 31,
+      "prompt_tokens": 3420674,
+      "cached_tokens": 3059584,
+      "output_tokens": 15132,
+      "running": 2,
+      "waiting": 0,
+      "snapshot_held_mib": 954,
+      "snapshot_budget_mib": 1024,
+      "snapshot_states": 8,
+      "cumulative_budget_evictions": 22
+    },
+    {
+      "completed_model_steps": 41,
+      "prompt_tokens": 4959770,
+      "cached_tokens": 4581248,
+      "output_tokens": 18909,
+      "running": 1,
+      "waiting": 0,
+      "snapshot_held_mib": 957,
+      "snapshot_budget_mib": 1024,
+      "snapshot_states": 8,
+      "cumulative_budget_evictions": 25,
+      "median_prompt_tokens": 147908
+    }
+  ],
+  "derived": {
+    "overall_reuse_percent": 92.37,
+    "additional_model_steps": 10,
+    "additional_prompt_tokens": 1539096,
+    "additional_cached_tokens": 1521664,
+    "additional_reuse_percent": 98.87
+  },
+  "observations": {
+    "both_ranks_oom": false,
+    "both_ranks_restarts": 0,
+    "reported_throttling": false,
+    "reported_large_prefix_physical_invalidations": 0,
+    "cache_refusals": 0,
+    "cache_failures": 0,
+    "client_left_events": 1,
+    "client_left_cause": "unknown"
+  },
+  "limitations": [
+    "Two queue samples can miss brief waiting.",
+    "One or two sampled running requests do not establish eight-lane saturation.",
+    "Model completions do not establish project completion or answer quality.",
+    "No matched production response latency or whole-project speedup was measured.",
+    "Bounded head logs and both-rank metadata do not cover every worker GPU diagnostic.",
+    "Absence of large-prefix physical invalidations does not prove absence for every small prefix."
+  ],
+  "new_generation_requests_for_publication": 0,
+  "new_model_actions_for_publication": 0
+}

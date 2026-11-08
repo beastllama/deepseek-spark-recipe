@@ -1,0 +1,34 @@
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -617,7 +617,14 @@
+                 moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size) or self.keptOver(sn.base + sn.at, sn.base + size, sn);
+             } else s.reuse_failed = true;
+         }
+-        if (s.cut_in_limit > 0 and kept == null) return error.FillBusy;
++        if (s.cut_in_limit > 0 and (kept == null or len -| kept.?.at > s.cut_in_limit)) return error.FillBusy;
++        // A cached cut-in cannot fall back to a cold pass. Refuse before placement can stale its
++        // source (or other states) when no extent fits while preserving the source's required rows.
++        // A live-held source keeps placeKept's existing ContextFull retry and patience behavior.
++        if (s.cut_in_limit > 0 and moved) {
++            const sn = kept.?;
++            if (!clashes(taken[0..nt], sn.base, sn.base + sn.at) and !self.moveKeepsSource(taken[0..nt], size, sn)) return error.FillBusy;
++        }
+         const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
+         if (kept) |sn| if (moved and sn.stale) { // the placement needed the kept rows' room: the prompt runs from 0
+             if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} found no room to move to ({d} positions); the prompt runs from 0", .{ sn.at, sn.base, size });
+@@ -910,6 +917,15 @@
+         const aligned = sn.at % model.chunk_rows == 0 or
+             (self.fine_snapshot and sn.at % self.fine_snapshot_grid == 0);
+         return !sn.stale and sn.at > 0 and sn.at < len and aligned and sn.at <= len -| self.m.cfg.window;
++    }
++
++    /// Whether a relocated extent can fit while keeping the source's required rows. Other kept states
++    /// and the source's unused reservation tail may still give their room to a successful placement.
++    fn moveKeepsSource(self: *const Lanes, live: []const [2]usize, size: usize, source: *const Snap) bool {
++        var rows: [max_streams + 1][2]usize = undefined;
++        @memcpy(rows[0..live.len], live);
++        rows[live.len] = .{ source.base, source.base + source.at };
++        return place(rows[0 .. live.len + 1], size, self.m.pool_cap) != null;
+     }
+ 
+     /// The first extent that fits around the live streams and the kept states. Kept states give their room oldest

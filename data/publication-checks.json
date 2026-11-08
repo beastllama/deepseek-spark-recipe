@@ -1,16 +1,35 @@
 {
-  "date": "2026-11-07",
-  "patch_applies_to_public_pin": true,
+  "date": "2026-11-08",
+  "recipe_version": "v0.2-source-preview",
+  "patches_apply_to_public_pin_in_order": true,
   "source_closure_files": 1117,
-  "source_closure_sha256": "4df32ee4fc221d4e773542005750fd4fa411deed331ab2d8218fab5785eb85ce",
-  "patch_sha256": "3da4edaff9df6dee1183b89ce644448a88715774adb5b342be13926453db073a",
-  "bash_syntax": "pass",
+  "source_closure_bytes": 9878200,
+  "source_closure_sha256": "e6581809b03c00c99f79f090ee4891dda0f3ee1b7bbb0159b78f8d2454a80b8c",
+  "bash_syntax": "pass: launch adapter and runtime environment example",
   "python_syntax": "pass",
+  "python_module_load": "pass",
   "json_parse": "pass",
-  "aot_extension_rows": "17-64",
-  "aot_extension_artifacts": 48,
-  "aot_extension_bytes": 18795792,
+  "aot_extension": {
+    "rows": "17-64",
+    "artifacts": 48,
+    "bytes": 18795792
+  },
+  "manifest_inventory_consistency": {
+    "status": "pass",
+    "modified": 53,
+    "added": 7
+  },
+  "retained_gpu_bundle_hashes_match_saved_v02_build": true,
+  "patch_series_hashes": "pass",
+  "numeric_calculations": "pass",
+  "authored_markdown_links": "pass",
+  "upstream_notice_links": "preserved verbatim; inherited relative links excluded",
+  "historical_source_rejected_by_current_manifest": "pass",
   "private_host_path_and_token_pattern_scan": "pass",
+  "typecheck_task": "not applicable: docs and patch package; Python syntax/module checks passed",
+  "build_task": "not applicable: no package build; exact source reconstruction passed",
   "clean_publication_build_executed": false,
-  "model_actions": 0
+  "new_native_model_builds": 0,
+  "model_actions": 0,
+  "generation_requests": 0
 }
