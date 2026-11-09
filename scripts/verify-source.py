@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the recorded native source closure (v0.2 by default)."""
+"""Verify the recorded candidate native source closure; runtime validation is separate."""
 import argparse
 import hashlib
 import json

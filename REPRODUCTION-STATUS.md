@@ -1,21 +1,28 @@
 # Reproduction status
 
-This publication contains measured results and an exact source/configuration recipe. **No new clean build, model start, asset download/preparation or generation run was performed to validate the public packaging.**
+This publication contains measured results and an exact source/configuration recipe. **A clean public ARM64/GPU build and independent reproduction remain unexecuted.** The saved operational UI jobs qualify the exact retained artifacts identified below; they do not qualify a clean build of this public packaging.
+
+The v0.3.0 source preview records **`ACTUAL_UI_QUALIFICATION_PASSED`** for the saved recency trial. A separate fresh startup established artifact and settings equivalence, then persistent selection was observed at 23:51:13 UTC on November 8. The adoption used zero additional inference requests. Historical v0.2 observations retain their original identities. [Qualification and deployment evidence](data/recency-results.json).
 
 | Item | Evidence / status |
 | --- | --- |
 | Historical speed results | Saved v0.1 SparkDash jobs, 8/8 capped streams and two successful cold-prefix prefill samples; original image `dac7945c…`, not rerun on v0.2 |
-| Long-history evidence | Separate paired 3×170K pressure sample and cold/post-overwrite 32K recall, plus passive all-client reuse observations; no whole-project gain measured |
-| Tested source | 1,117-file v0.2 closure `e6581809b03c00c99f79f090ee4891dda0f3ee1b7bbb0159b78f8d2454a80b8c`; historical `4df32ee4…` manifest remains available |
-| Public reconstruction | `fbbc97132cd004237d9887b8d3185896efaedc5c` plus all three patches in `data/patch-series.json` order; every recorded source file can be checked by `scripts/verify-source.py` |
-| Source build | Saved local v0.2 native rebuild passed with retained GPU bundles and changed head/follower binaries; clean public ARM64/GPU build remains unexecuted |
+| Historical long-history evidence | Separate v0.2 paired 3×170K pressure sample and cold/post-overwrite 32K recall, plus passive all-client reuse observations; no whole-project gain measured |
+| Current recency source | 1,117-file compact-Store recency closure `aa0f3dcdda5da77c13debb69ad4ac4fe1549518af54925ec3e7b80ab8441a041`, core `8210b249…`; source identity, trial qualification and persistent selection are separate |
+| Historical source | Published v0.2 closure `e6581809b03c00c99f79f090ee4891dda0f3ee1b7bbb0159b78f8d2454a80b8c` and v0.1 `4df32ee4…` remain in their archived manifests |
+| Public reconstruction | `fbbc97132cd004237d9887b8d3185896efaedc5c` plus all four patches in `data/patch-series.json` order; every recorded candidate source file can be checked by `scripts/verify-source.py` |
+| Candidate build and continuity | Native compilation completed with retained GPU bundles; overall original build observation remains FAIL after a confirmed memory-watchdog interruption of the serving predecessor. Separate COPY-only compiled-payload acceptance does not itself establish the later UI qualification or broad GPU parity |
+| Historical source build | Saved local v0.2 native rebuild passed with retained GPU bundles and changed head/follower binaries; clean public ARM64/GPU build remains unexecuted |
 | GPU bundles | 21 retained fatbin SHA-256 values published; exact CUDA source/build helper matches the public base pin; fresh toolchain byte equivalence remains unverified |
 | Kernel kit | Public base-kit pin, exact 48-cubin release references, staging helper and expected merged AOT digest published; no binary assets redistributed |
 | Model assets | Exact EAQ, Keys and Engram references plus narrow license metadata checks; operators acquire and prepare their own assets |
 | Native launch | Actual selected argv/environment transcribed into a configurable single-rank adapter; new public adapter has not been used to start a pair |
-| Source modifications | Earlier retained changes, refused-cut-in guard and full-prefix backing are included in the ordered series; the two earlier focused PRs alone are insufficient |
+| Source modifications | Earlier retained changes, refused-cut-in guard, full-prefix backing and the compact-Store recency condition are included in the ordered series; earlier focused PRs alone are insufficient |
 | Peer compatibility | v0.2 changes snapshot save/restore frames: head and follower must use the same updated build; no head-only replacement |
-| Focused upstream port | The new full-prefix peer-specific port needs independent review/qualification; the earlier admission PRs do not contain it |
+| Focused upstream ports | Existing drafts #54/#55/#56 remain focused and independently unqualified for native/GPU use. Newer public `e100ee8` has branch-point policy protection; the compact-Store recency defect has not been reproduced there |
+| Required memory guards | Both retained head and worker guards remain required, with the existing 2.5 GiB sustained/1 GiB emergency thresholds; no guard retirement or new reserve floor is part of the candidate |
+| Recency SparkDash qualification | Actual ten-request sequential retention job completed 10/10 correct, with final 75,776/76,048 cached/input tokens after two C-pressure budget evictions; separate 32K control scored 16/16 with no stale values. Both ranks were ready/unrestarted in the measured interval |
+| Deployment selection observation | Identical qualified image, source, both binaries and settings selected and ready at 2026-11-08 23:51:13 UTC. Both memory guards and exact bindings verified, normal recovery and liveness active, trial fallback inactive |
 | Clean independent reproduction | Pending |
 
 Remaining proof requirements before claiming a tested turnkey installer or byte-identical build:
@@ -26,4 +33,4 @@ Remaining proof requirements before claiming a tested turnkey installer or byte-
 4. Bind the exact SparkDash collector source/version and local overlay to a public pin. The published method/settings and saved results are known, but the complete dashboard overlay is not part of this engine source closure.
 5. For any independent reproduction, save complete configurations, cached-token evidence and boundary counters for the stated UI protocol. Report cold priming, measured follow-up wave and whole benchmark job separately for pressure comparisons. Keep capped speed observations, narrow recall and passive reuse separate from completed-answer quality and whole-project finish time.
 
-Publication static checks and source-patch verification should be recorded separately from model/runtime validation. Neither screenshots nor source review is a new runtime pass.
+Publication static checks and source-patch verification remain separate from the recorded model/runtime qualification. Neither screenshots nor source review alone is a runtime pass, and saved qualification does not assert the currently selected lifecycle.

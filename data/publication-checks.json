@@ -1,35 +1,71 @@
 {
-  "date": "2026-11-08",
-  "recipe_version": "v0.2-source-preview",
-  "patches_apply_to_public_pin_in_order": true,
+  "status": "QUALIFIED_ARTIFACT_SELECTED_SOURCE_PREVIEW",
+  "publication_stage": "SOURCE_PREVIEW_PREPARATION",
+  "release_version": "v0.3.0",
   "source_closure_files": 1117,
-  "source_closure_bytes": 9878200,
-  "source_closure_sha256": "e6581809b03c00c99f79f090ee4891dda0f3ee1b7bbb0159b78f8d2454a80b8c",
-  "bash_syntax": "pass: launch adapter and runtime environment example",
-  "python_syntax": "pass",
-  "python_module_load": "pass",
-  "json_parse": "pass",
-  "aot_extension": {
-    "rows": "17-64",
-    "artifacts": 48,
-    "bytes": 18795792
+  "source_closure_sha256": "aa0f3dcdda5da77c13debb69ad4ac4fe1549518af54925ec3e7b80ab8441a041",
+  "core_sha256": "8210b249ee4f66000b2ecb4dd9b6c376dbcdf3eb66b2e275d14677f38e9e9130",
+  "fourth_patch_sha256": "e9100fbb5683b9240efbac8ea3e0c74b2765eac3a5f0491b025bcf27c5665551",
+  "ordered_public_archive_reconstruction": "PASS_OFFLINE_SOURCE_RECONSTRUCTION",
+  "static_checks": {
+    "status": "PASS_STATIC_PREPARATION_ONLY",
+    "runtime_validation_status": "NOT_ASSESSED_BY_STATIC_CHECKS_SEE_RUNTIME_QUALIFICATION",
+    "json_files_parsed": 21,
+    "python_syntax": "PASS",
+    "authored_local_markdown_links": "PASS",
+    "source_inventory": {
+      "modified": 53,
+      "added": 7
+    },
+    "source_closure": {
+      "files": 1117,
+      "bytes": 9878221,
+      "sha256": "aa0f3dcdda5da77c13debb69ad4ac4fe1549518af54925ec3e7b80ab8441a041"
+    },
+    "all_four_patch_sha256": "PASS",
+    "original_three_patches_results_credits_licenses": "UNCHANGED",
+    "original_attribution_in_updated_notice": "PRESERVED",
+    "retained21_fatbin_hashes": "UNCHANGED",
+    "candidate_build_identity_vs_actual_compiled_proof": "PASS",
+    "compile_PASS_vs_original_continuity_FAIL_separate": true,
+    "release_version_chosen": true,
+    "private_path_and_credential_shape_scan": "PASS",
+    "typecheck_task": "Not applicable: docs/patch recipe; Python syntax checked",
+    "build_task": "No native/Docker/GPU build executed; exact four-step source reconstruction passed",
+    "model_actions": 0,
+    "generation_requests": 0,
+    "pushes": 0,
+    "pull_request_writes": 0,
+    "bash_syntax": "PASS: unchanged launch-rank.sh and runtime.env.example"
   },
-  "manifest_inventory_consistency": {
-    "status": "pass",
-    "modified": 53,
-    "added": 7
-  },
-  "retained_gpu_bundle_hashes_match_saved_v02_build": true,
-  "patch_series_hashes": "pass",
-  "numeric_calculations": "pass",
-  "authored_markdown_links": "pass",
-  "upstream_notice_links": "preserved verbatim; inherited relative links excluded",
-  "historical_source_rejected_by_current_manifest": "pass",
-  "private_host_path_and_token_pattern_scan": "pass",
-  "typecheck_task": "not applicable: docs and patch package; Python syntax/module checks passed",
-  "build_task": "not applicable: no package build; exact source reconstruction passed",
-  "clean_publication_build_executed": false,
-  "new_native_model_builds": 0,
+  "publication_clean_rebuild_executed": false,
+  "new_native_model_builds_for_publication": 0,
+  "action_counter_scope": "Publication preparation only; the 11 actual qualification requests are recorded separately in runtime_qualification and data/recency-results.json",
   "model_actions": 0,
-  "generation_requests": 0
+  "generation_requests": 0,
+  "pushes": 0,
+  "pull_request_writes": 0,
+  "claims": [
+    "The actual ten-request retention check and one 32K Native Quality control passed in their original trial; the original epoch is preserved",
+    "Fresh startup and persistent selection of the identical tested artifact were observed, with zero additional benchmark jobs or inference requests",
+    "No matched before-GPU comparison, new throughput result or whole-project gain is claimed",
+    "Clean public GPU rebuild and byte equivalence remain unverified",
+    "Compiled-payload success remains distinct from the original build continuity FAIL",
+    "The defect on the newer public policy is unproven; PR54/55/56 patches are unchanged"
+  ],
+  "source_closure_bytes": 9878221,
+  "deployment_status": "SELECTED_AND_READY_AT_OBSERVATION",
+  "runtime_qualification": {
+    "status": "ACTUAL_UI_QUALIFICATION_PASSED_ORIGINAL_TRIAL",
+    "receipt_sha256": "d366a7825e4d4c85db21694af3e3b74f9c27491e965625074442b903523541b1",
+    "result_file": "data/recency-results.json",
+    "new_model_requests_for_publication": 0
+  },
+  "deployment_observation": {
+    "observation_result_file": "data/recency-results.json",
+    "observed_at_utc": "2026-11-08T23:51:13.779361+00:00",
+    "selection_receipt_sha256": "2e6e9d5ea9717aa4c64a2fb26f0a9a47d69f5c37fd52e62dc4cf2749fb2fc469",
+    "artifact_equivalence_receipt_sha256": "2404253fe565dbc72ced8dfa490b27d32d5b15dee373b040fc2fa5100d543d4a",
+    "startup_receipt_sha256": "13cba3a298555d5b30afec442b818c25d0c1459ffd4d5e89c2fed460f8ffd8f1"
+  }
 }

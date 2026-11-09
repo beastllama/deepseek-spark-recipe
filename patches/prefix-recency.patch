@@ -1,0 +1,12 @@
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -395,7 +395,7 @@
+             if (e.shared or e == skip) continue; // a shared cut is evicted only as the least recently used
+             const now = prompt.len > e.born and prompt.len > e.tokens.len and std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens); // this prompt extends it
+             const moved_on = now or for (s.entries.items) |o| {
+-                if (o != e and o.born > e.born and o.tokens.len > e.tokens.len and std.mem.eql(u32, o.tokens[0..e.tokens.len], e.tokens)) break true;
++                if (o != e and o.born > e.born and o.used >= e.used and o.tokens.len > e.tokens.len and std.mem.eql(u32, o.tokens[0..e.tokens.len], e.tokens)) break true;
+             } else false;
+             if (moved_on and (best == null or e.used < s.entries.items[best.?].used)) best = i;
+         }
