@@ -10,5 +10,22 @@
     "url": "https://github.com/bertholomus/TensorFold/pull/55"
   },
   "base": "e100ee8b1d806a9f516d7a01cbcbf06ae98d77e1",
-  "independent_review": "No remaining blocking findings; CPU regressions/controls reviewed; native build and GPU qualification limits retained"
+  "independent_review": "No remaining blocking findings; CPU regressions/controls reviewed; native build and GPU qualification limits retained",
+  "backing": {
+    "draft": true,
+    "commit": "72bdec97a0c43e3fb163323daeb706f8612c99f7",
+    "url": "https://github.com/bertholomus/TensorFold/pull/56",
+    "scope": "Independent packed-prefix backing port; public native/GPU qualification remains pending"
+  },
+  "compact_recency": {
+    "status": "PUBLIC_UPSTREAM_DEFECT_UNPROVEN",
+    "public_base": "e100ee8b1d806a9f516d7a01cbcbf06ae98d77e1",
+    "public_policy": "zig/src/core/prompt_cache_policy.zig",
+    "existing_prs_unchanged": [
+      54,
+      55,
+      56
+    ],
+    "note": "Current public core marks reused extended states branched and its split victim policy protects them. Reproduce current public semantics before proposing this compact-Store one-line fix upstream."
+  }
 }

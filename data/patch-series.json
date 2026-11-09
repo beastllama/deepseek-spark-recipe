@@ -30,8 +30,27 @@
         "zig/src/families/dsv41/model.zig": "aedc0bb3dcc1d4429617b249016a1b0fb3f5727f771cbd83fd89658e96e344ad",
         "zig/src/families/dsv41/lanes.zig": "0c5f845b9452b84811d5d406206aa571d8deaafdf30897530e729524ac21e541"
       },
-      "result_manifest": "data/source-manifest.json",
+      "result_manifest": "data/source-manifest-v0.2.json",
       "result_source_tree_sha256": "e6581809b03c00c99f79f090ee4891dda0f3ee1b7bbb0159b78f8d2454a80b8c"
+    },
+    {
+      "path": "patches/prefix-recency.patch",
+      "sha256": "e9100fbb5683b9240efbac8ea3e0c74b2765eac3a5f0491b025bcf27c5665551",
+      "preimages_sha256": {
+        "zig/src/core/prompt_cache.zig": "c25bcb27b5c095b251d348cd8506229c32ef1788e260700b43e5b236c904180e"
+      },
+      "postimages_sha256": {
+        "zig/src/core/prompt_cache.zig": "8210b249ee4f66000b2ecb4dd9b6c376dbcdf3eb66b2e275d14677f38e9e9130"
+      },
+      "result_manifest": "data/source-manifest.json",
+      "result_source_tree_sha256": "aa0f3dcdda5da77c13debb69ad4ac4fe1549518af54925ec3e7b80ab8441a041",
+      "validation_status": "ACTUAL_UI_QUALIFICATION_PASSED_ORIGINAL_TRIAL",
+      "scope": "Compact Store in the published recipe source pipeline; identical defect on newer public branch is unproven",
+      "qualification_receipt_sha256": "d366a7825e4d4c85db21694af3e3b74f9c27491e965625074442b903523541b1"
     }
-  ]
+  ],
+  "status": "QUALIFIED_ARTIFACT_SELECTED_SOURCE_PREVIEW",
+  "release_version": "v0.3.0",
+  "deployment_status": "SELECTED_AND_READY_AT_OBSERVATION",
+  "qualification_receipt_sha256": "d366a7825e4d4c85db21694af3e3b74f9c27491e965625074442b903523541b1"
 }

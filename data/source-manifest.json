@@ -1,7 +1,7 @@
 {
   "base_repository": "https://github.com/bertholomus/TensorFold",
   "base_revision": "fbbc97132cd004237d9887b8d3185896efaedc5c",
-  "source_tree_sha256": "e6581809b03c00c99f79f090ee4891dda0f3ee1b7bbb0159b78f8d2454a80b8c",
+  "source_tree_sha256": "aa0f3dcdda5da77c13debb69ad4ac4fe1549518af54925ec3e7b80ab8441a041",
   "manifest": {
     ".zig-version": "02d38e98e88f4a8dc2ea40dbb769338601066fc94920b52882a14f21ad97f7ee",
     "build.zig": "feafe265172d61139ee35e9b35308de76c1b336d693f744d9ddb1b87460569ba",
@@ -380,7 +380,7 @@
     "zig/src/core/lanes/windows.zig": "ff5ea835ed487c6f6236833fa4ca94073c32396c3ff7520329a02de8ea497c9d",
     "zig/src/core/moe_route.zig": "aa0c7c3a3977c00b58bb1bc38a0611bac03e4673411925a2e19c903187f89dee",
     "zig/src/core/npy.zig": "b9a4d01a60f293133019bc9752a6e6bcfc113aabdb36ff499a3cf03b820f1adf",
-    "zig/src/core/prompt_cache.zig": "c25bcb27b5c095b251d348cd8506229c32ef1788e260700b43e5b236c904180e",
+    "zig/src/core/prompt_cache.zig": "8210b249ee4f66000b2ecb4dd9b6c376dbcdf3eb66b2e275d14677f38e9e9130",
     "zig/src/core/prompt_cache_test.zig": "48518b6106258eed4fb7ad8deb1f5ddeaafabde101b1903f2d883b562db7c8a7",
     "zig/src/core/prompt_imprint.zig": "ee48e34ef5609d205dabfaa5396f3517d3a7a81dbcc0af1283d3a8696a17849a",
     "zig/src/core/prompt_imprint_test.zig": "490fbcdc3b905c1982e4dd8fbb521ef54484742443e6178b58ac16c397325350",
@@ -1120,5 +1120,10 @@
     "zig/tests/wide_probe.zig": "f3fcb404928545382f5515a99d69ab654bb6c39841f5dd729b144fce4bd01642",
     "zig/tests/wide_streams.zig": "bead8ec0f098509fc029fe08bd599b7a6325b6f5f9be9a77bcf27fdd19c30ba2",
     "zig/tests/wide_trees.zig": "41934b1041369fe06201311354a7152aa69afd8ff1e5d19f571b8eaad7ce0160"
-  }
+  },
+  "status": "QUALIFIED_ARTIFACT_SELECTED_SOURCE_PREVIEW",
+  "source_identity_scope": "Exact compiled and qualified engine source. Runtime evidence is recorded separately in recency-results.json.",
+  "deployment_status": "SELECTED_AND_READY_AT_OBSERVATION",
+  "qualification_receipt_sha256": "d366a7825e4d4c85db21694af3e3b74f9c27491e965625074442b903523541b1",
+  "release_version": "v0.3.0"
 }

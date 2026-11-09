@@ -1,0 +1,427 @@
+{
+  "status": "ACTUAL_UI_QUALIFICATION_PASSED_IDENTICAL_ARTIFACT_SELECTED",
+  "recipe_version": "v0.3.0",
+  "artifact": {
+    "image": "sha256:9a739e0dc2692b7dc33e8c2e9a4ebd49257bb586fcac398955def5627ca555c5",
+    "source_tree_sha256": "aa0f3dcdda5da77c13debb69ad4ac4fe1549518af54925ec3e7b80ab8441a041",
+    "source_files": 1117,
+    "core_sha256": "8210b249ee4f66000b2ecb4dd9b6c376dbcdf3eb66b2e275d14677f38e9e9130",
+    "binary_sha256": {
+      "head": "28dd1671e3f74e13194ec634458273a42592092cd414649c2c890a6a8c293219",
+      "worker": "32151257211da4a9c75eeeeb0f74309b33a3b3513fd67aae7ff770f1f18f10b9"
+    }
+  },
+  "qualification": {
+    "receipt_sha256": "d366a7825e4d4c85db21694af3e3b74f9c27491e965625074442b903523541b1",
+    "observed_at_epoch_seconds": 1794180235.343796,
+    "observed_at_utc": "2026-11-08T23:23:55.343796+00:00",
+    "original_trial_deadline": 1794180310.4231122,
+    "original_trial_selected": false,
+    "original_lifecycle_outcome": "Qualification passed before the original deadline. Timing guards prevented selection in that trial, and normal fallback closed the trial.",
+    "requests_executed": {
+      "retention": 10,
+      "quality_control": 1,
+      "total": 11
+    }
+  },
+  "settings": {
+    "context_tokens": 524288,
+    "slots": 8,
+    "engine_streams": 32,
+    "cache_budget_bytes": 1073741824,
+    "max_output_tokens": 32768,
+    "reasoning_effort": "high",
+    "fine_snapshot_grid": 128,
+    "tail": 128,
+    "weights_revision": "45ee5d0fd106c94a3d77f721e09cbb2f50e5a16b",
+    "keys_revision": "de412d2249632903dace23399526e00a145aada5"
+  },
+  "retention": {
+    "status": "completed",
+    "started_at_ms": 1794179272191,
+    "completed_at_ms": 1794179751377,
+    "elapsed_seconds": 479.186,
+    "elapsed_as_displayed": "7m 59s",
+    "configuration": {
+      "port": 8888,
+      "modelId": "DeepSeek-V4.1-Flash-1017",
+      "concurrencies": [
+        1
+      ],
+      "maxTokens": 400,
+      "hotShortCache": true,
+      "reasoningEffort": "high",
+      "promptType": "structured",
+      "temperature": 0.7,
+      "thinking": true,
+      "topK": 20,
+      "contextTokens": 159000
+    },
+    "requests": 10,
+    "successful_requests": 10,
+    "recall_correct": 10,
+    "failed_requests": 0,
+    "hidden_primers_or_retries": 0,
+    "steps": [
+      {
+        "index": 1,
+        "role": "Cold B1",
+        "prompt_tokens": 159049,
+        "cached_tokens": 0,
+        "completion_tokens": 48,
+        "ttft_as_displayed": "72.98s",
+        "recall_passed": true,
+        "started_at_ms": 1794179272229,
+        "completed_at_ms": 1794179345746,
+        "cache_after": {
+          "states": 3,
+          "held_mib": 179,
+          "spare_mib": 0,
+          "budget_mib": 1024,
+          "evicted": 0,
+          "kept": 3,
+          "refused": 0,
+          "failed": 0
+        }
+      },
+      {
+        "index": 2,
+        "role": "Cold B2",
+        "prompt_tokens": 159049,
+        "cached_tokens": 16384,
+        "completion_tokens": 53,
+        "ttft_as_displayed": "66.18s",
+        "recall_passed": true,
+        "started_at_ms": 1794179345746,
+        "completed_at_ms": 1794179412542,
+        "cache_after": {
+          "states": 4,
+          "held_mib": 319,
+          "spare_mib": 0,
+          "budget_mib": 1024,
+          "evicted": 0,
+          "kept": 1,
+          "refused": 0,
+          "failed": 0
+        }
+      },
+      {
+        "index": 3,
+        "role": "Cold B3",
+        "prompt_tokens": 159049,
+        "cached_tokens": 16384,
+        "completion_tokens": 53,
+        "ttft_as_displayed": "66.13s",
+        "recall_passed": true,
+        "started_at_ms": 1794179412543,
+        "completed_at_ms": 1794179479294,
+        "cache_after": {
+          "states": 5,
+          "held_mib": 459,
+          "spare_mib": 0,
+          "budget_mib": 1024,
+          "evicted": 0,
+          "kept": 1,
+          "refused": 0,
+          "failed": 0
+        }
+      },
+      {
+        "index": 4,
+        "role": "Cold B4",
+        "prompt_tokens": 159049,
+        "cached_tokens": 16384,
+        "completion_tokens": 63,
+        "ttft_as_displayed": "66.30s",
+        "recall_passed": true,
+        "started_at_ms": 1794179479294,
+        "completed_at_ms": 1794179546327,
+        "cache_after": {
+          "states": 6,
+          "held_mib": 599,
+          "spare_mib": 0,
+          "budget_mib": 1024,
+          "evicted": 0,
+          "kept": 1,
+          "refused": 0,
+          "failed": 0
+        }
+      },
+      {
+        "index": 5,
+        "role": "Cold B5",
+        "prompt_tokens": 159049,
+        "cached_tokens": 16384,
+        "completion_tokens": 48,
+        "ttft_as_displayed": "66.31s",
+        "recall_passed": true,
+        "started_at_ms": 1794179546327,
+        "completed_at_ms": 1794179613132,
+        "cache_after": {
+          "states": 7,
+          "held_mib": 739,
+          "spare_mib": 0,
+          "budget_mib": 1024,
+          "evicted": 0,
+          "kept": 1,
+          "refused": 0,
+          "failed": 0
+        }
+      },
+      {
+        "index": 6,
+        "role": "A short",
+        "prompt_tokens": 76048,
+        "cached_tokens": 16384,
+        "completion_tokens": 50,
+        "ttft_as_displayed": "26.55s",
+        "recall_passed": true,
+        "started_at_ms": 1794179613132,
+        "completed_at_ms": 1794179640346,
+        "cache_after": {
+          "states": 8,
+          "held_mib": 810,
+          "spare_mib": 0,
+          "budget_mib": 1024,
+          "evicted": 0,
+          "kept": 1,
+          "refused": 0,
+          "failed": 0
+        }
+      },
+      {
+        "index": 7,
+        "role": "A long extension",
+        "prompt_tokens": 159040,
+        "cached_tokens": 75776,
+        "completion_tokens": 52,
+        "ttft_as_displayed": "40.69s",
+        "recall_passed": true,
+        "started_at_ms": 1794179640347,
+        "completed_at_ms": 1794179681711,
+        "cache_after": {
+          "states": 9,
+          "held_mib": 950,
+          "spare_mib": 0,
+          "budget_mib": 1024,
+          "evicted": 0,
+          "kept": 1,
+          "refused": 0,
+          "failed": 0
+        }
+      },
+      {
+        "index": 8,
+        "role": "A short refresh",
+        "prompt_tokens": 76048,
+        "cached_tokens": 75776,
+        "completion_tokens": 50,
+        "ttft_as_displayed": "462ms",
+        "recall_passed": true,
+        "started_at_ms": 1794179681711,
+        "completed_at_ms": 1794179682832,
+        "cache_after": {
+          "states": 9,
+          "held_mib": 950,
+          "spare_mib": 0,
+          "budget_mib": 1024,
+          "evicted": 0,
+          "kept": 0,
+          "refused": 0,
+          "failed": 0
+        }
+      },
+      {
+        "index": 9,
+        "role": "Cold C pressure",
+        "prompt_tokens": 159048,
+        "cached_tokens": 16384,
+        "completion_tokens": 71,
+        "ttft_as_displayed": "66.57s",
+        "recall_passed": true,
+        "started_at_ms": 1794179682832,
+        "completed_at_ms": 1794179750256,
+        "cache_after": {
+          "states": 8,
+          "held_mib": 932,
+          "spare_mib": 0,
+          "budget_mib": 1024,
+          "evicted": 2,
+          "kept": 1,
+          "refused": 0,
+          "failed": 0
+        }
+      },
+      {
+        "index": 10,
+        "role": "A short replay",
+        "prompt_tokens": 76048,
+        "cached_tokens": 75776,
+        "completion_tokens": 50,
+        "ttft_as_displayed": "473ms",
+        "recall_passed": true,
+        "started_at_ms": 1794179750256,
+        "completed_at_ms": 1794179751376,
+        "cache_after": {
+          "states": 8,
+          "held_mib": 932,
+          "spare_mib": 0,
+          "budget_mib": 1024,
+          "evicted": 2,
+          "kept": 0,
+          "refused": 0,
+          "failed": 0
+        }
+      }
+    ],
+    "final_replay": {
+      "prompt_tokens": 76048,
+      "cached_tokens": 75776,
+      "uncached_tail_tokens": 272,
+      "ttft_as_displayed": "473ms",
+      "refresh_ttft_as_displayed": "462ms",
+      "shared_system_cached_tokens": 16384,
+      "same_deep_reuse_as_refresh": true
+    },
+    "ttft_precision": "Values are transcribed from the saved rendered SparkDash result; display rounding is preserved",
+    "native_correlation": "Chronological per-step windows plus exact usage counters; equal numeric tuples alone are not request identity",
+    "budget_pressure": {
+      "budget_bytes": 1073741824,
+      "before_c_held_mib_logged": 950,
+      "before_c_held_bytes_lower_bound": 996147200,
+      "before_c_held_precision": "Native log reports whole MiB; this is a conservative lower bound, not an exact allocation",
+      "c_actual_prompt_tokens": 159048,
+      "source_derived_snapshot_end": 157696,
+      "charge_formula": {
+        "fixed_bytes": 6684672,
+        "bytes_per_token": 890
+      },
+      "source_derived_incoming_snapshot_bytes": 147034112,
+      "charge_is_measured_allocation": false,
+      "held_lower_bound_plus_source_charge_bytes": 1143181312,
+      "exceeds_budget_by_at_least_bytes": 69439488,
+      "budget_evictions_during_c": 2,
+      "snapshots_kept_during_c": 1
+    },
+    "native_markers": {
+      "gpu_or_oom_error": 0,
+      "unparsed_completions": 0,
+      "unparsed_cache_reports": 0,
+      "cache_invalidations": 0
+    },
+    "bounded_log_coverage_complete": true,
+    "raw_logs_published": false
+  },
+  "quality_control": {
+    "status": "completed",
+    "started_at_ms": 1794179895141,
+    "completed_at_ms": 1794179912948,
+    "elapsed_seconds": 17.807,
+    "elapsed_as_displayed": "17.8 s",
+    "configuration": {
+      "port": 8888,
+      "modelId": "DeepSeek-V4.1-Flash-1017",
+      "contextLength": 524288,
+      "suiteVersion": 1,
+      "scoringVersion": 2,
+      "categories": [
+        "long"
+      ],
+      "longSizes": [
+        32768
+      ],
+      "longItems": 1,
+      "concurrency": 1
+    },
+    "prompt_tokens": 36910,
+    "completion_tokens": 116,
+    "correct": 16,
+    "total": 16,
+    "stale": 0,
+    "finish_reason": "stop",
+    "native_cached_tokens": 0,
+    "native_thinking": false,
+    "token_sha_prefix": "ed441b7ed6bb",
+    "scope": "One 32K-target long-context item with 36,910 actual prompt tokens; not a broad quality evaluation"
+  },
+  "test_interval_health": {
+    "before_ready": true,
+    "after_ready": true,
+    "same_rank_ids_before_after": true,
+    "oom_count": 0,
+    "rank_restarts": 0,
+    "thermal_normal_both": true
+  },
+  "source_bindings": {
+    "sparkdash_source_sha256": {
+      "server/index.js": "5a7c1925eb55da7ef1e781e42f1848108c7eed5a0901748ab3368273f3fb8b0a",
+      "server/collectors/DecodeBench.js": "70d043451ac5a585e6cc961f96c357b654fb188f0f8476a4482cd9744c1e1339",
+      "src/components/SparkPage/BenchmarkDialog.tsx": "0e4cf438c7142d87b72ceb0cf14283ffdacb46c57bcff661530806b0d7981805",
+      "src/api/types.ts": "7df38a11b7a8f59936d0d3da854dd1192aca922eeee4fcde6ebca41be654cd95"
+    },
+    "quality_source_sha256": {
+      "server/collectors/QualityBench.js": "3865984729739ae96119a4073444df32edead9e3b13670dcee05100c85aeb3ab",
+      "server/collectors/qualitySuite.js": "b632160c569a78c020cdda1705dbcac5c679134dfbc7357b0968f22402b35e4b"
+    },
+    "historical_quality_gate_sha256": "ce1df28db075e488fd286529cfc37becb79eb10fa6ccd1d09d4911f13d1aa79c",
+    "complete_public_dashboard_overlay_reproduction": "unverified",
+    "retention_validation_prerequisite": "Compatible local SparkDash overlay with the Hot-short cache retention control, fresh TensorFold shared-pool capacity, and native cached-token reporting"
+  },
+  "saved_receipt_sha256": {
+    "RETENTION-CAPTURE-OBSERVED.json": "fa511d32f34915f3809dec1e5c8b5a640d6af610287c6cc4ca00d09094b14d50",
+    "RETENTION-DOM-OBSERVED.json": "139f68ac0a5362335e4ad0155505935421b10eb6397dcb35bd789e70ca4d64a7",
+    "RETENTION-JOB-OBSERVED.json": "9fad08fbdc4b2ba8386058c57245860f77ec62bfc6294e7370bb7100b3d23490",
+    "RETENTION-NUMERIC-OBSERVED.json": "03ec630a4ea51877efa5c9dfe5c4933c4b217b5d278c633888ad5ba6e3225d50",
+    "QUALITY-CAPTURE-OBSERVED.json": "ea7df7c6f6c631c8014d40034b3d807c9ec298a4c784c6acf0be337a99f5a3a5",
+    "QUALITY-DOM-OBSERVED.json": "7d230565f7033902a943c14c57be85f37b24bb3d01fc410dcba998e2888169bd",
+    "QUALITY-CONTROL-OBSERVED.json": "290d4b9f644e18454e895948710505b0c97be0b31e4860e3c18fd4aa7a996dbc",
+    "QUALITY-BACKEND-OBSERVED.json": "9f26cabcf010e5b8a2050ee974630102a39017a0a18561fedbc7d8f55d8c5cac",
+    "QUALIFIED-TRIAL-OBSERVED.json": "d366a7825e4d4c85db21694af3e3b74f9c27491e965625074442b903523541b1"
+  },
+  "deployment": {
+    "status": "SELECTED_AND_READY_AT_OBSERVATION",
+    "observed_at_utc": "2026-11-08T23:51:13.779361+00:00",
+    "method": "Historical qualification of the identical tested artifact plus fresh startup and persistent selection",
+    "same_image_source_and_both_binaries_as_qualified": true,
+    "same_serving_settings_as_qualified": true,
+    "both_memory_guards_verified": true,
+    "persistent_bindings_verified": true,
+    "normal_recovery_and_liveness_active": true,
+    "trial_fallback_inactive_at_selection": true,
+    "additional_benchmark_jobs": 0,
+    "additional_inference_requests": 0,
+    "saved_receipt_sha256": {
+      "COMMIT-OBSERVED.json": "2e6e9d5ea9717aa4c64a2fb26f0a9a47d69f5c37fd52e62dc4cf2749fb2fc469",
+      "ARTIFACT-EQUIVALENCE-OBSERVED.json": "2404253fe565dbc72ced8dfa490b27d32d5b15dee373b040fc2fa5100d543d4a",
+      "FRESH-STARTUP-OBSERVED.json": "13cba3a298555d5b30afec442b818c25d0c1459ffd4d5e89c2fed460f8ffd8f1"
+    }
+  },
+  "limits": [
+    "One after-fix GPU retention sample; no matched before-fix GPU run or GPU speedup percentage",
+    "479.186 seconds is the whole deliberately cold-filled ten-request pipeline, not decode throughput or whole-project duration",
+    "Ten correct sentinel recalls and one 16/16 quality item do not establish broad semantic quality or tensor-byte equality",
+    "CPU baseline 6 / candidate 7 / full-core 19 tests each are a separate deterministic eviction-policy reproduction",
+    "Clean public ARM64/GPU packaging rebuild and binary equivalence remain unverified",
+    "The three historical shallow misses are not individually attributed to this defect",
+    "Historical v0.1/v0.2 speed and pressure results belong to their original images"
+  ],
+  "publication_actions": {
+    "new_model_requests": 0,
+    "pushes": 0,
+    "pull_request_writes": 0
+  },
+  "offline_policy_reproduction": {
+    "scope": "Deterministic compact Store CPU eviction-policy reproduction, distinct from the later GPU retention check",
+    "receipt_sha256": "040b5c2c235d71aa9d68dfa6bbbd97d95da64d9e5818940cc70383565bb91071",
+    "baseline_focused_tests_passed": 6,
+    "candidate_focused_tests_passed": 7,
+    "existing_core_tests_passed_each": 19,
+    "fixture_budget_bytes": 1073741824,
+    "short_prompt_tokens": 76000,
+    "baseline_reused_tokens": 16384,
+    "candidate_reused_tokens": 75776,
+    "restored_checksum_matches": true,
+    "state_representation": "16-byte checksum state charged logically; independent snapshots; no physical-stale test",
+    "physical_gpu_stale_or_tensor_parity_test": false
+  }
+}

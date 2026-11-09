@@ -1,0 +1,37 @@
+{
+  "base_repository": "https://github.com/bertholomus/TensorFold",
+  "base_revision": "fbbc97132cd004237d9887b8d3185896efaedc5c",
+  "apply_in_order": [
+    {
+      "path": "patches/tested-stack.patch",
+      "sha256": "3da4edaff9df6dee1183b89ce644448a88715774adb5b342be13926453db073a",
+      "result_manifest": "data/source-manifest-v0.1.json",
+      "result_source_tree_sha256": "4df32ee4fc221d4e773542005750fd4fa411deed331ab2d8218fab5785eb85ce"
+    },
+    {
+      "path": "patches/cache-cut-in.patch",
+      "sha256": "4b8a5a3748fa8f1b1b422865cfe4cce1d0d34df6bd8d9f71265042f1504dc517",
+      "preimages_sha256": {
+        "zig/src/families/dsv41/lanes.zig": "e067821838ca4824a821e71488623a1dca805b5f3d99a919abac2ec3ebf23e50"
+      },
+      "postimages_sha256": {
+        "zig/src/families/dsv41/lanes.zig": "3504a0a002a0004bbb9909f118acab5282d66593bcd90f8326507eb262d32f53"
+      },
+      "result_source_tree_sha256": "c3d01df87896197e3f67e1ba06cf85992987d05ed3f4cc4d72dc17594cf3da04"
+    },
+    {
+      "path": "patches/full-prefix-backing.patch",
+      "sha256": "395096cd80665dd90d5d4724f977ff5912ab164793c8b7eef72ce791177ca7a5",
+      "preimages_sha256": {
+        "zig/src/families/dsv41/model.zig": "1b35574c2bc8c0fc18d6fb0ae30c87bf1f661b58c82c6c8dda51e30a1e4da015",
+        "zig/src/families/dsv41/lanes.zig": "3504a0a002a0004bbb9909f118acab5282d66593bcd90f8326507eb262d32f53"
+      },
+      "postimages_sha256": {
+        "zig/src/families/dsv41/model.zig": "aedc0bb3dcc1d4429617b249016a1b0fb3f5727f771cbd83fd89658e96e344ad",
+        "zig/src/families/dsv41/lanes.zig": "0c5f845b9452b84811d5d406206aa571d8deaafdf30897530e729524ac21e541"
+      },
+      "result_manifest": "data/source-manifest.json",
+      "result_source_tree_sha256": "e6581809b03c00c99f79f090ee4891dda0f3ee1b7bbb0159b78f8d2454a80b8c"
+    }
+  ]
+}

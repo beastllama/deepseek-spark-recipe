@@ -69,7 +69,7 @@
     "path": "zig/src/core/prompt_cache.zig",
     "change": "modified",
     "base_sha256": "9195c6a0a840c887215c8482e006242795a80407e767d2a1a727ef9efca9f282",
-    "tested_sha256": "c25bcb27b5c095b251d348cd8506229c32ef1788e260700b43e5b236c904180e"
+    "tested_sha256": "8210b249ee4f66000b2ecb4dd9b6c376dbcdf3eb66b2e275d14677f38e9e9130"
   },
   {
     "path": "zig/src/core/template/template.zig",
