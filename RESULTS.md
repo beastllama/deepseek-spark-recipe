@@ -1,5 +1,7 @@
 # November 7–8, 2026 observations
 
+See the separate [November 15 shared-pool admission comparison](ADMISSION-BENCHMARK.md) for the four-request natural-completion wave, its raw numeric results and the measured tradeoffs.
+
 ## Compact Store recency in v0.3.0
 
 The saved SparkDash trial qualified image `sha256:9a739e0dc2692b7dc33e8c2e9a4ebd49257bb586fcac398955def5627ca555c5` and source closure `aa0f3dcdda5da77c13debb69ad4ac4fe1549518af54925ec3e7b80ab8441a041`. A separate startup verified the identical artifact and settings before persistent selection. Historical v0.1 and v0.2 measurements later in this page retain their original image bindings.

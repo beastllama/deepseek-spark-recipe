@@ -1,0 +1,227 @@
+{
+  "protocol": "admission-natural-eos-v1",
+  "captureDateAmericaChicago": "2026-11-15",
+  "hardware": {
+    "nvidiaDgxSparks": 2,
+    "tensorParallel": 2,
+    "apiSlots": 8,
+    "physicalSlots": 32
+  },
+  "configuration": {
+    "sparkDashVersion": "2.90.0",
+    "sparkDashBaseCommit": "24daeb57390a33b414cec214200625b0a3dcb736",
+    "logicalContextTokens": 524288,
+    "promptCacheGiB": 1,
+    "roundRows": 64,
+    "reservationAlignment": 2048,
+    "primerCount": 1,
+    "primerMaxOutputTokens": 8,
+    "waveRequests": 4,
+    "waveMaxOutputTokens": 32768,
+    "naturalCompletion": true,
+    "thinking": true,
+    "reasoningEffort": "high",
+    "temperature": 0.7,
+    "topP": 1,
+    "topK": 20,
+    "targetTailTokens": [
+      1024,
+      2048,
+      4096,
+      8192
+    ]
+  },
+  "baseline": {
+    "physicalPoolTokens": 524288,
+    "imageSha256": "sha256:d6eae0fd082363f23618e339c9f38448e9d0e3e1cc40189a073a8b235c77603f",
+    "syntheticSeed": 68515676,
+    "benchmarkTotalMs": 95840,
+    "requests": [
+      {
+        "probeRole": "Admission prime",
+        "reportedPromptTokens": 114760,
+        "cachedTokens": 0,
+        "uncachedPromptTokens": 114760,
+        "maxOutputTokens": 8,
+        "completionTokens": 8,
+        "finishReason": "length",
+        "ttftContentMs": null,
+        "totalMs": 53361.85
+      },
+      {
+        "probeRole": "Admission tail 2048",
+        "reportedPromptTokens": 116849,
+        "cachedTokens": 114560,
+        "uncachedPromptTokens": 2289,
+        "maxOutputTokens": 32768,
+        "completionTokens": 558,
+        "finishReason": "stop",
+        "ttftContentMs": 14868.16,
+        "totalMs": 23845.85,
+        "reservationPositions": 151552
+      },
+      {
+        "probeRole": "Admission tail 1024",
+        "reportedPromptTokens": 115825,
+        "cachedTokens": 114560,
+        "uncachedPromptTokens": 1265,
+        "maxOutputTokens": 32768,
+        "completionTokens": 661,
+        "finishReason": "stop",
+        "ttftContentMs": 18563.59,
+        "totalMs": 25167.66,
+        "reservationPositions": 149504
+      },
+      {
+        "probeRole": "Admission tail 8192",
+        "reportedPromptTokens": 122993,
+        "cachedTokens": 114560,
+        "uncachedPromptTokens": 8433,
+        "maxOutputTokens": 32768,
+        "completionTokens": 886,
+        "finishReason": "stop",
+        "ttftContentMs": 24323.12,
+        "totalMs": 29698.17,
+        "reservationPositions": 157696
+      },
+      {
+        "probeRole": "Admission tail 4096",
+        "reportedPromptTokens": 118897,
+        "cachedTokens": 114688,
+        "uncachedPromptTokens": 4209,
+        "maxOutputTokens": 32768,
+        "completionTokens": 858,
+        "finishReason": "stop",
+        "ttftContentMs": 38587.76,
+        "totalMs": 42433.68,
+        "reservationPositions": 153600
+      }
+    ],
+    "completionTokensInWave": 2963,
+    "fullWaveReservationPositions": 612352,
+    "measurements": {
+      "comparisonValid": true,
+      "waveDurationMs": 42444.89518699999,
+      "completedRequests": 4,
+      "requestsPerMinute": 5.654390214479953,
+      "meanCompletionMs": 30286.34,
+      "meanFirstAnswerMs": 24085.6575,
+      "p95LongestPauseMs": 1071.24
+    },
+    "traffic": {
+      "completedDelta": 5,
+      "disconnectDelta": 0,
+      "submitted": 5,
+      "maxRunning": 3,
+      "maxWaiting": 3,
+      "samplingMs": 250,
+      "discarded": false
+    }
+  },
+  "candidate": {
+    "physicalPoolTokens": 655360,
+    "imageSha256": "sha256:5096fa2e23dfdf30dc9a82b93e82233b7e9e4026eea862f992938a5721e512df",
+    "syntheticSeed": 58567700,
+    "benchmarkTotalMs": 87069,
+    "requests": [
+      {
+        "probeRole": "Admission prime",
+        "reportedPromptTokens": 114805,
+        "cachedTokens": 0,
+        "uncachedPromptTokens": 114805,
+        "maxOutputTokens": 8,
+        "completionTokens": 8,
+        "finishReason": "length",
+        "ttftContentMs": null,
+        "totalMs": 53516.78
+      },
+      {
+        "probeRole": "Admission tail 1024",
+        "reportedPromptTokens": 115870,
+        "cachedTokens": 114560,
+        "uncachedPromptTokens": 1310,
+        "maxOutputTokens": 32768,
+        "completionTokens": 499,
+        "finishReason": "stop",
+        "ttftContentMs": 16545.28,
+        "totalMs": 25659.16,
+        "reservationPositions": 149504
+      },
+      {
+        "probeRole": "Admission tail 8192",
+        "reportedPromptTokens": 123038,
+        "cachedTokens": 114560,
+        "uncachedPromptTokens": 8478,
+        "maxOutputTokens": 32768,
+        "completionTokens": 508,
+        "finishReason": "stop",
+        "ttftContentMs": 20859.21,
+        "totalMs": 28430.89,
+        "reservationPositions": 157696
+      },
+      {
+        "probeRole": "Admission tail 4096",
+        "reportedPromptTokens": 118942,
+        "cachedTokens": 114688,
+        "uncachedPromptTokens": 4254,
+        "maxOutputTokens": 32768,
+        "completionTokens": 814,
+        "finishReason": "stop",
+        "ttftContentMs": 27359.46,
+        "totalMs": 31851.91,
+        "reservationPositions": 153600
+      },
+      {
+        "probeRole": "Admission tail 2048",
+        "reportedPromptTokens": 116894,
+        "cachedTokens": 114688,
+        "uncachedPromptTokens": 2206,
+        "maxOutputTokens": 32768,
+        "completionTokens": 815,
+        "finishReason": "stop",
+        "ttftContentMs": 29349.22,
+        "totalMs": 33526.5,
+        "reservationPositions": 151552
+      }
+    ],
+    "completionTokensInWave": 2636,
+    "fullWaveReservationPositions": 612352,
+    "measurements": {
+      "comparisonValid": true,
+      "waveDurationMs": 33532.247554,
+      "completedRequests": 4,
+      "requestsPerMinute": 7.1572894007032,
+      "meanCompletionMs": 29867.115,
+      "meanFirstAnswerMs": 23528.292499999996,
+      "p95LongestPauseMs": 1529.54
+    },
+    "traffic": {
+      "completedDelta": 5,
+      "disconnectDelta": 0,
+      "submitted": 5,
+      "maxRunning": 4,
+      "maxWaiting": 3,
+      "samplingMs": 250,
+      "discarded": false
+    }
+  },
+  "candidateRecall": {
+    "contextTokens": 32768,
+    "items": 2,
+    "passed": 2,
+    "keysCorrect": 32,
+    "keysTotal": 32,
+    "stale": 0,
+    "errors": 0
+  },
+  "validation": {
+    "matchedPairs": 1,
+    "contaminatedPrimerExcluded": true,
+    "candidateIntervalCompletedRequests": 8,
+    "candidateIntervalObservedOom": 0,
+    "candidateIntervalObservedRestarts": 0,
+    "sparkDashPatchSha256": "bb3bdb1f37ff77d727a89ceb143f6a99ecc05316862b00bf0f5a2c69fa8757e8",
+    "cleanIndependentHardwareReproduction": false
+  },
+  "scope": "Sanitized synthetic results. Natural completions varied in output length. Full recovery/platform qualification and real-work throughput are outside this sample."
+}

@@ -16,14 +16,31 @@ export TF_FILL_CHUNKS=1 TF_FILL_CUT_IN=8192 TF_DS_ROUND_ROWS=64
 export NCCL_NET_PLUGIN=spcx NCCL_IB_HCA="$TF_RDMA_DEVICES" NCCL_IB_GID_INDEX="$TF_RDMA_GID_INDEX"
 export TF_DS_GRAPHS=1 TF_DS_HC_SIDE=1 TF_DS_L2_PREFETCH=1 TF_DS_ENGRAM_AIO=1
 export TENSORFOLD_CUDA_KERNELS="$TF_DS_KIT/aot"
+# Select a matching source build on both ranks before enabling an admission arm.
+worker_pool=524288
+worker_context=()
+case "${ADMISSION_PROFILE:-historical}" in
+  historical|baseline) ;;
+  shared-pool)
+    worker_pool=655360
+    worker_context=(--context 524288)
+    ;;
+  *) echo 'ADMISSION_PROFILE must be historical, baseline or shared-pool' >&2; exit 2 ;;
+esac
 if [[ "$rank" == worker ]]; then
   exec "$BIN_ROOT/bin/tf-dsv41-lanes" "$CHECKPOINT_DIR" "$RANK_CACHE_DIR" 1 2 \
     "$TF_TP_MASTER" "$TF_TP_PORT" "$TF_DS_KIT" --engram "$TF_DS_ENGRAM" \
-    --token-map "$TF_DS_TOKEN_MAP" --pool 524288 --streams 32 --drafts 1 \
+    --token-map "$TF_DS_TOKEN_MAP" --pool "$worker_pool" "${worker_context[@]}" --streams 32 --drafts 1 \
     --graphs 1 --side 1 --prefetch 1 --aio 1 --rdma "$TF_RDMA_DEVICES" \
     --round-rows 64 --round-ms "$TF_DS_ROUND_MS"
 fi
 export TF_DS_RANK_CACHE="$RANK_CACHE_DIR" TF_DS_FINE_SNAPSHOT_128=1 TF_AI_OPS_SPANS=1
+if [[ "${ADMISSION_PROFILE:-historical}" != historical ]]; then
+  export TF_CACHED_FILL_PIECES_MAX=16384
+fi
+if [[ "${ADMISSION_PROFILE:-historical}" == shared-pool ]]; then
+  export TF_DS_POOL_TOKENS="$worker_pool"
+fi
 api_host=${API_HOST:-127.0.0.1}
 auth=()
 if [[ -n "${API_KEY_FILE:-}" ]]; then

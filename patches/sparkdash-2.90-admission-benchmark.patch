@@ -1,0 +1,2467 @@
+diff --git a/server/collectors/CachedTailBench.js b/server/collectors/CachedTailBench.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..180feeb4b2410f278960d62aec52c49361bd842e
+--- /dev/null
++++ b/server/collectors/CachedTailBench.js
+@@ -0,0 +1,342 @@
++import { createHash } from 'node:crypto';
++import { runStreamingRequest, sleep } from './LlmStreaming.js';
++import { streamPauseMeter, p95LongestPause } from './streamPause.js';
++
++const WORDS = 'harbor ledger copper window marble signal orchard violet engine paper silver lantern meadow anchor cobalt thistle granite ribbon falcon ember quartz willow saddle beacon canyon velvet timber russet nickel fennel garnet pillow summit drizzle walnut cinder trellis pebble mantle saffron'.split(' ');
++
++// System.Random(int) compatibility with the owner's PowerShell replay fixture.
++export function replayRandom(seed) {
++  const a = new Array(56).fill(0), max = 2147483647;
++  let mj = 161803398 - Math.abs(seed), mk = 1;
++  a[55] = mj;
++  for (let i = 1; i < 55; i++) {
++    const ii = (21 * i) % 55; a[ii] = mk; mk = mj - mk;
++    if (mk < 0) mk += max; mj = a[ii];
++  }
++  for (let k = 0; k < 4; k++) for (let i = 1; i < 56; i++) {
++    a[i] -= a[1 + (i + 30) % 55]; if (a[i] < 0) a[i] += max;
++  }
++  let next = 0, nextp = 21;
++  return () => {
++    if (++next >= 56) next = 1; if (++nextp >= 56) nextp = 1;
++    let r = a[next] - a[nextp]; if (r === max) r--; if (r < 0) r += max;
++    a[next] = r; return r / max;
++  };
++}
++
++export function replayFiller(seed, words) {
++  const random = replayRandom(seed), out = [`Document seed ${seed}. `];
++  for (let i = 0; i < words; i++) out.push(WORDS[Math.floor(random() * WORDS.length)], i % 17 === 16 ? '. ' : ' ');
++  return out.join('');
++}
++
++export function validateCachedTail(mode, mixed = false, hot = false) {
++  if (mode == null || mode === '') return null;
++  if (!['replay', 'replay-candidate', 'pause', 'pause-candidate', 'branch', 'branch-resume', 'admission'].includes(mode) || mixed || hot) {
++    const err = new Error('Choose cached-tail replay or pause alone'); err.status = 400; throw err;
++  }
++  return mode;
++}
++
++export function replayGate(streams) {
++  const a = streams.find(s => s.probeRole === '12K alone');
++  const q = streams.find(s => s.probeRole === '12K queued');
++  const b = streams.find(s => s.probeRole === '63K blocker');
++  // Declared reproduction band, not a speed-improvement acceptance threshold.
++  return !!a && !!q && !!b && [a,q].every(s => !s.error && s.cachedTokens === 124928)
++    && b.cachedTokens === 0 && !b.error && q.overlappedColdFill === true
++    && Number.isFinite(a.nativeTtftSeconds) && Number.isFinite(q.nativeTtftSeconds)
++    && a.nativeTtftSeconds >= 4.4 && a.nativeTtftSeconds <= 9.2 && q.nativeTtftSeconds >= 19.9 && q.nativeTtftSeconds <= 41.3;
++}
++
++export function candidateReplayGate(streams) {
++  const a = streams.find(s => s.probeRole === '12K alone');
++  const q = streams.find(s => s.probeRole === '12K queued');
++  const b = streams.find(s => s.probeRole === '63K blocker');
++  // Measurement validity only: improvement/regression is assessed against a separate baseline.
++  return !!a && !!q && !!b && [a,q].every(s => !s.error && s.cachedTokens === 124928)
++    && b.cachedTokens === 0 && !b.error && q.overlappedColdFill === true
++    && [a,q].every(s => Number.isFinite(s.nativeTtftSeconds) && s.nativeTtftSeconds >= 0);
++}
++
++export function outsideTraffic(start, current, submitted) {
++  const done = current.completed - start.completed;
++  return done < 0 || current.disconnects !== start.disconnects || done + current.running + current.waiting > submitted;
++}
++
++// This scenario measures queuing; unlike a decode wave it does not require all
++// four reservations to fit at once. Each full request must fit independently.
++export function validateAdmissionCapacity(poolTokens, contextTokens) {
++  if (!Number.isSafeInteger(poolTokens) || poolTokens < 524288 ||
++      !Number.isSafeInteger(contextTokens) || contextTokens < 163840) {
++    const err = new Error('Admission measurement requires fresh capacity: 524288 shared KV tokens and at least 163840 context');
++    err.status = 400; throw err;
++  }
++}
++
++export async function runCachedTailScenario({ baseUrl, modelId, mode, salt, abortSignal, apiKey, onStep, branchPrior = null }) {
++  const controller = new AbortController();
++  const abort = () => controller.abort();
++  if (abortSignal?.aborted) abort();
++  abortSignal?.addEventListener('abort', abort, { once: true });
++  const deadline = setTimeout(abort, 30 * 60_000);
++  const signal = controller.signal, pending = new Set(), streams = [], samples = [];
++  const started = performance.now();
++  const seed = createHash('sha256').update(salt).digest().readUInt32LE(0) % 100000000 + 10000;
++  const headers = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
++  let stage = '', error = null, drain = null, traffic = null, watchStop = null, watchPromise = null;
++  async function gauge(parentSignal = signal) {
++    const r = await fetch(`${baseUrl}/metrics`, { headers, signal: AbortSignal.any([parentSignal, AbortSignal.timeout(8000)]) });
++    if (!r.ok) throw new Error('Cannot read live request counts');
++    const text = await r.text();
++    const value = name => { const m = text.match(new RegExp(`^tensorfold:${name} (\\d+)`, 'm')); if (!m) throw new Error('Missing live request count'); return Number(m[1]); };
++    return { running: value('requests_running'), waiting: value('requests_waiting'), completed: value('request_latency_seconds_count'), disconnects: value('client_disconnections_total') };
++  }
++  async function idle() {
++    const g = await gauge(); if (g.running || g.waiting) throw new Error('Fleet is not idle; no scenario request submitted'); return g;
++  }
++  function checkTraffic(g) {
++    if (!traffic) return;
++    if (outsideTraffic(traffic.start, g, traffic.submitted)) traffic.discarded = true;
++    traffic.last = g;
++    if (mode === 'admission') {
++      traffic.maxRunning = Math.max(traffic.maxRunning ?? 0, g.running);
++      traffic.maxWaiting = Math.max(traffic.maxWaiting ?? 0, g.waiting);
++      if (traffic.discarded) abort(); // Cancel only this benchmark's requests.
++    }
++  }
++  async function finishTraffic() {
++    if (!traffic) return;
++    watchStop.abort(); await watchPromise;
++    const g = await gauge(); checkTraffic(g);
++    if (g.running || g.waiting || g.completed - traffic.start.completed !== traffic.submitted) traffic.discarded = true;
++    const row = samples.find(s => s.sample === traffic.sample) ?? { sample: traffic.sample };
++    if (!samples.includes(row)) samples.push(row);
++    row.traffic = { start: traffic.start, end: g, submitted: traffic.submitted, discarded: traffic.discarded,
++      ...(mode === 'admission' ? { maxRunning: traffic.maxRunning ?? 0, maxWaiting: traffic.maxWaiting ?? 0, samplingMs: 250 } : {}) };
++    if (traffic.discarded) {
++      row.reproduced = false; row.overlapVerified = false; row.discarded = true;
++      if (mode.endsWith('-candidate') || mode === 'admission') row.comparisonValid = false;
++      for (const s of streams.filter(s => s.sample === traffic.sample)) s.discarded = true;
++      traffic = null; throw new Error('Sample discarded: outside traffic, counter reset, disconnect or unverified request accounting');
++    }
++    traffic = null;
++  }
++  function ask(role, content, sample, maxTokens = 8) {
++    if (traffic?.discarded) throw new Error('Sample discarded: outside traffic detected');
++    if (traffic) traffic.submitted++;
++    const pause = streamPauseMeter();
++    const state = { first: null, last: null, done: false, result: null };
++    const body = { model: modelId, messages: [{ role: 'user', content }], max_tokens: maxTokens, temperature: 0, stream: true, stream_options: { include_usage: true } };
++    if (mode === 'admission') Object.assign(body, { temperature: 0.7, top_p: 1, top_k: 20, reasoning_effort: 'high' });
++    else if (maxTokens > 8) Object.assign(body, { min_tokens: maxTokens, ignore_eos: true, stop: [] });
++    const requestStartedAt = Date.now();
++    const promise = (async () => {
++      const r = await runStreamingRequest(`${baseUrl}/v1/chat/completions`, body, signal, {
++        apiKey, debug: true, retryOnThinking400: false,
++        onDelta(d) { pause.note(d); state.first ??= d.tFirst; state.last = d.tLast; },
++      });
++      const row = {
++        index: streams.length, sample, probeRole: role, ttftMs: r.ttftMs,
++        totalMs: r.totalMs, decodeTps: r.decodeTps, decodeTokens: r.decodeTokens,
++        completionTokens: r.completionTokens, prefillTokens: r.prefillTokens,
++        reportedPromptTokens: r.usage?.promptTokens ?? null, tokenSha: r.tensorfold?.tokenSha ?? null, nativeTtftSeconds: r.tensorfold?.ttftSeconds ?? null, nativePrefillSeconds: r.tensorfold?.prefillSeconds ?? null, cachedTokens: r.cachedPromptTokensReported ? r.cachedPromptTokens : null,
++        prefillTps: r.prefillTps, error: r.error ? 'Request failed' : (r.completionTokens > 0 ? null : 'No generated tokens'),
++        ...pause.result(), promptSha256: createHash('sha256').update(content).digest('hex'),
++        ...(mode === 'admission' ? {
++          maxOutputTokens: maxTokens, finishReason: r.finishReason ?? null,
++          ttftContentMs: r.ttftContentMs ?? null,
++          probeStartedAt: requestStartedAt, probeFinishedAt: Date.now(),
++          uncachedPromptTokens: r.cachedPromptTokensReported && Number.isFinite(r.usage?.promptTokens)
++            ? r.usage.promptTokens - r.cachedPromptTokens : null,
++        } : {}),
++      };
++      state.result = row; streams.push(row); return row;
++    })().finally(() => { state.done = true; pending.delete(promise); });
++    pending.add(promise); promise.catch(() => {}); state.promise = promise; return state;
++  }
++  async function waitFor(test, milliseconds, message) {
++    const until = performance.now() + milliseconds;
++    while (!test()) { if (performance.now() > until) throw new Error(message); await sleep(100, signal); }
++  }
++  try {
++    const prior = branchPrior?.samples ?? [];
++    const cells = mode === 'admission' ? [1] : mode.startsWith('branch') ? [1024, 2048, 4096, 8192, 12288, 200].filter(n => !prior.some(s => s.targetExtensionTokens === n)) : [1, 2, 3];
++    const initialCells = cells.length;
++    for (let sample = 1; sample <= cells.length; sample++) {
++      const startCounts = await idle();
++      traffic = { sample, start: startCounts, submitted: 0, discarded: false };
++      watchStop = new AbortController();
++      watchPromise = (async () => {
++        try {
++          while (!watchStop.signal.aborted) {
++            await sleep(250, watchStop.signal);
++            const g = await gauge(); checkTraffic(g);
++          }
++        } catch { if (!watchStop.signal.aborted && traffic) { traffic.discarded = true; if (mode === 'admission') abort(); } }
++      })();
++      const s = seed + sample * 100;
++      if (mode === 'admission') {
++        const prefix = 'The following reference is synthetic context. Ignore its word order. Follow the task after END REFERENCE.\n' + replayFiller(s, 86000);
++        stage = 'Prime one fresh approximately 115K prefix'; onStep?.(stage);
++        const prime = await ask('Admission prime', prefix, sample).promise;
++        if (traffic.discarded) throw new Error('Sample discarded: outside traffic or unverified live request counts during primer');
++        if (prime.error || prime.cachedTokens !== 0 || !Number.isInteger(prime.reportedPromptTokens) ||
++            prime.reportedPromptTokens < 110000 || prime.reportedPromptTokens > 118000) {
++          throw new Error('Admission prefix geometry or cold cache accounting is invalid');
++        }
++        checkTraffic(await idle());
++        if (traffic.discarded) throw new Error('Outside traffic before admission wave');
++        stage = 'Four requests: 32K output allowance, High, natural completion'; onStep?.(stage);
++        const waveStart = performance.now();
++        const tails = [1024, 2048, 4096, 8192];
++        const wave = await Promise.all(tails.map((tail, i) => ask(`Admission tail ${tail}`,
++          prefix + `\nContinuation ${i + 1}.` + ' harbor'.repeat(tail) +
++          '\nEND REFERENCE. Give exactly 12 concise numbered checks for a safe database backup and restore. Explain the purpose of each in one sentence. Stop after check 12.', sample, 32768).promise));
++        const waveDurationMs = performance.now() - waveStart;
++        // Repeated space-prefixed words are one token each for this fixture.
++        // Allow 256 tokens for chat framing/instructions, and at most one
++        // 2048-row placement block of prefix rounding. Report actual values.
++        const valid = wave.every((r,i) => !r.error && r.finishReason === 'stop' &&
++          Number.isFinite(r.ttftContentMs) && r.ttftContentMs >= 0 &&
++          Number.isInteger(r.reportedPromptTokens) && r.reportedPromptTokens >= 110000 && r.reportedPromptTokens <= 126000 &&
++          r.reportedPromptTokens - prime.reportedPromptTokens >= tails[i] - 256 &&
++          r.reportedPromptTokens - prime.reportedPromptTokens <= tails[i] + 256 &&
++          Number.isInteger(r.cachedTokens) && r.cachedTokens >= prime.reportedPromptTokens - 2048 && r.cachedTokens <= prime.reportedPromptTokens &&
++          Number.isInteger(r.uncachedPromptTokens) && r.uncachedPromptTokens > 0);
++        samples.push({ sample, comparisonValid: valid, waveDurationMs,
++          completedRequests: wave.filter(r => !r.error && r.finishReason === 'stop').length,
++          requestsPerMinute: valid ? 4 * 60000 / waveDurationMs : null,
++          meanCompletionMs: wave.reduce((n,r) => n + r.totalMs, 0) / 4,
++          meanFirstAnswerMs: valid ? wave.reduce((n,r) => n + r.ttftContentMs, 0) / 4 : null,
++          p95LongestPauseMs: p95LongestPause(wave) });
++        if (!valid) throw new Error('Admission sample lacks natural completion, first answer, or expected native prompt/cache geometry');
++        await finishTraffic();
++        continue;
++      }
++      const A = replayFiller(s, 94535);
++      const short = A + ' Tail eleven. ' + replayFiller(s + 1, 148);
++      const big = A + ' Tail twelve. ' + replayFiller(s + 2, 8863);
++      stage = `Sample ${sample}/${cells.length}: prime 126K prefix`; onStep?.(stage);
++      const prime = await ask('126K prime', mode.startsWith('branch') ? A : short, sample).promise;
++      if (prime.error || prime.cachedTokens !== 0) throw new Error('Fresh prefix was not cold or failed');
++      if (mode.startsWith('branch')) {
++        const n = cells[sample - 1];
++        stage = `Branch cell ${sample}: extend by ${n} target tokens alone`; onStep?.(stage);
++        // One repeated space-prefixed word per target token; native usage verifies actual geometry.
++        const extension = await ask(`Extend ${n}`, A + ' harbor'.repeat(n), sample).promise;
++        if (extension.error || extension.cachedTokens !== 124928) throw new Error('Branch point was not restorable before extension');
++        stage = `Branch cell ${sample}: different continuation from A`; onStep?.(stage);
++        const probe = await ask(`Branch after ${n}`, A + ' copper'.repeat(200), sample).promise;
++        if (probe.error || !Number.isFinite(probe.cachedTokens)) throw new Error('Branch recall failed or cache accounting missing');
++        if (![extension.reportedPromptTokens, prime.reportedPromptTokens].every(v => Number.isInteger(v) && v > 0)) throw new Error('Native prompt token counts unavailable');
++        const actual = extension.reportedPromptTokens - prime.reportedPromptTokens;
++        if (!Number.isFinite(actual) || actual <= 0) throw new Error('Extension token geometry unavailable');
++        samples.push({ sample, targetExtensionTokens: n, actualExtensionTokens: actual,
++          primeTokens: prime.reportedPromptTokens, extensionCachedTokens: extension.cachedTokens,
++          branchCachedTokens: probe.cachedTokens, branchNativeTtftSeconds: probe.nativeTtftSeconds,
++          branchTtftMs: probe.ttftMs, retained: probe.cachedTokens === 124928 });
++      } else if (mode === 'replay' || mode === 'replay-candidate') {
++        stage = `Sample ${sample}/3: 12K alone`; onStep?.(stage);
++        const alone = await ask('12K alone', A + ' Tail ten. ' + replayFiller(s + 5, 8863), sample).promise;
++        if (alone.error || alone.cachedTokens !== 124928) throw new Error('Alone replay did not restore 124,928 tokens');
++        // Re-establish the near-A tip after the long continuation, exactly as replay3 does.
++        stage = `Sample ${sample}/3: restore near-A tip`; onStep?.(stage);
++        const reset = await ask('Near-A reset', short, sample).promise;
++        if (reset.error) throw new Error('Near-A reset failed');
++        stage = `Sample ${sample}/3: 12K behind cold 63K`; onStep?.(stage);
++        const blocker = ask('63K blocker', replayFiller(s + 3, 47267), sample);
++        const until = performance.now() + 20000;
++        while ((await gauge()).running < 1) {
++          if (performance.now() > until) throw new Error('Blocker did not start');
++          await sleep(200, signal);
++        }
++        await sleep(3000, signal);
++        if (blocker.first != null || blocker.done) throw new Error('Blocker finished prefill before queued submission');
++        const q = await ask('12K queued', big, sample).promise;
++        q.overlappedColdFill = true;
++        const b = await blocker.promise;
++        if (mode === 'replay-candidate') {
++          const valid = candidateReplayGate([alone,q,b]); samples.push({ sample, comparisonValid: valid });
++          if (!valid) throw new Error('Candidate replay cache, overlap or timing measurement validation failed');
++        } else {
++          const passed = replayGate([alone,q,b]); samples.push({ sample, reproduced: passed });
++          if (!passed) throw new Error('Replay did not reproduce original timing/cache gate; stop before pause tests');
++        }
++      } else {
++        stage = `Sample ${sample}/3: six decoders, cold blocker, cached cut-in (eight total)`; onStep?.(stage);
++        const decoders = Array.from({ length: 6 }, (_, i) => ask(`Decoder ${i + 1}`, `Sequence ${s + i}: count integers from 1 to 10000, numbers only.`, sample, 2048));
++        await waitFor(() => decoders.every(d => d.first != null), 20000, 'Six decoders did not start');
++        if (decoders.some(d => d.done)) throw new Error('Decoder ended before overlap');
++        const blocker = ask('63K blocker', replayFiller(s + 3, 47267), sample);
++        const until = performance.now() + 20000;
++        let counts;
++        do {
++          counts = await gauge();
++          if (counts.running === 7 && counts.waiting === 0) break;
++          if (performance.now() > until || decoders.some(d => d.done)) throw new Error('Cold blocker admission not verified');
++          await sleep(100, signal);
++        } while (true);
++        await sleep(3000, signal);
++        counts = await gauge();
++        if (counts.running !== 7 || counts.waiting !== 0 || blocker.first != null || blocker.done || decoders.some(d => d.done)) throw new Error('Eight-stream overlap could not be established');
++        const at = performance.now();
++        const tail = ask('200-token cut-in', A + ' Tail thirteen. ' + replayFiller(s + 4, 148), sample);
++        const t = await tail.promise;
++        const allDecodersStillLive = decoders.every(d => !d.done);
++        const b = await blocker.promise;
++        const ds = await Promise.all(decoders.map(d => d.promise));
++        const valid = allDecodersStillLive && !t.error && t.cachedTokens === 124928 && b.cachedTokens === 0 && !b.error && ds.every(d => !d.error && d.streamEventGapCount > 0);
++        samples.push({ sample, overlapVerified: valid, liveDecodersAtTailArrival: 6, observedRunningBeforeTail: counts.running, observedWaitingBeforeTail: counts.waiting, totalSubmittedLive: 8, tailArrivalMs: at - started, p95LongestPauseMs: p95LongestPause(ds) });
++        if (mode === 'pause-candidate') samples.at(-1).comparisonValid = valid;
++        if (!valid) throw new Error('Pause sample overlap/cache validation failed');
++      }
++      await finishTraffic();
++      if (mode.startsWith('branch') && sample === initialCells) {
++        const ordered = [...prior, ...samples].sort((a,b) => a.targetExtensionTokens - b.targetExtensionTokens);
++        const edge = ordered.findIndex((r,i) => i > 0 && !r.retained && ordered[i-1].retained);
++        if (edge > 0) cells.push(Math.floor((ordered[edge-1].targetExtensionTokens + ordered[edge].targetExtensionTokens) / 2));
++      }
++    }
++  } catch (e) {
++    error = mode === 'admission' && traffic?.discarded
++      ? 'Sample discarded: outside traffic, counter reset, disconnect or unverified live request counts'
++      : e?.message || String(e);
++    if (watchStop) watchStop.abort(); if (watchPromise) await watchPromise; abort();
++  }
++  finally {
++    await Promise.allSettled([...pending]); clearTimeout(deadline);
++    if (traffic) {
++      const row = samples.find(s => s.sample === traffic.sample) ?? { sample: traffic.sample };
++      if (!samples.includes(row)) samples.push(row);
++      row.discarded = true; row.reproduced = false; row.overlapVerified = false;
++      if (mode.endsWith('-candidate') || mode === 'admission') row.comparisonValid = false;
++      row.traffic = { start: traffic.start, last: traffic.last, submitted: traffic.submitted, discarded: true };
++      for (const s of streams.filter(s => s.sample === traffic.sample)) s.discarded = true;
++    }
++    abortSignal?.removeEventListener('abort', abort);
++    const cleanupSignal = AbortSignal.timeout(30000);
++    try {
++      do {
++        drain = await gauge(cleanupSignal);
++        if (!drain.running && !drain.waiting) break;
++        await sleep(500, cleanupSignal);
++      } while (!cleanupSignal.aborted);
++    } catch { drain = { verified: false }; }
++    if (drain?.running !== 0 || drain?.waiting !== 0) error = (error ? error + '; ' : '') + 'Backend idle after scenario is unverified';
++  }
++  return {
++    concurrency: mode === 'admission' ? 4 : mode === 'pause' || mode === 'pause-candidate' ? 8 : 1, cachedTail: mode, samples, seed, drain, branchPrior,
++    streams, streamsOk: streams.filter(s => !s.error).length, streamsFailed: streams.filter(s => s.error).length,
++    meanDecodeTps: 0, aggregateDecodeTps: 0, meanTtftMs: 0, durationMs: performance.now() - started,
++    totalDecodeTokens: streams.reduce((n,s) => n + s.decodeTokens, 0),
++    totalCompletionTokens: streams.reduce((n,s) => n + s.completionTokens, 0),
++    ...(mode === 'admission' ? { admissionProtocol: {
++      version: 1, waveRequests: 4, primerRequests: 1, maxOutputTokens: 32768,
++      targetTailTokens: [1024, 2048, 4096, 8192], naturalCompletion: true,
++      temperature: 0.7, topK: 20, reasoningEffort: 'high',
++      limitations: 'Synthetic shared prefix and task, not replayed private work. First answer includes queue, prefill and reasoning. Queue wait requires matching native admission logs. Sampled occupancy can miss brief transitions. No speed verdict; compare separately.',
++    } } : {}),
++    error, model: modelId, warning: mode === 'admission' ? 'One synthetic four-request admission sample after one cold prime. 32K output allowance, natural completion, High, temperature 0.7. Compare completion and first-answer time; native logs are needed to isolate queue wait. Outside traffic invalidates the sample. No engine settings changed.' : mode === 'pause-candidate' ? 'Candidate pause: three samples, six decoders plus one cold fill and one cached short tail (eight live requests, after a separate prime). Same overlap/cache/traffic validity checks as original pause. SSE event gaps, not per-token latency; compare P95 and tail timings with baseline separately, no speed acceptance verdict. Does not test a third arrival behind a medium tail. No engine settings changed.' : mode === 'replay-candidate' ? 'Candidate replay: three samples with the original request sequence. Cache, cold overlap, traffic accounting and finite timings must be valid. No original timing band or speed acceptance verdict; compare recorded results with the baseline separately. No engine settings changed.' : mode.startsWith('branch') ? 'Sequential branch retention: fresh A primed in every cell, actual extension tokens from native usage; six cells and at most one bisection. No engine settings changed.' : 'SSE event gaps, not per-token latency. Pause overlap: six decoders plus one cold fill and one cached tail, eight requests total. Fixed three samples. Original replay reproduction band: alone 4.4–9.2 s; queued 19.9–41.3 s; cached exactly 124,928. No engine settings changed.',
++  };
++}
+diff --git a/server/collectors/DecodeBench.js b/server/collectors/DecodeBench.js
+index a425de814b47747e256ae467e22e3279f72f711b..ae4a7fe4ed49798253fce1d93a6ce5f458c0f223 100644
+--- a/server/collectors/DecodeBench.js
++++ b/server/collectors/DecodeBench.js
+@@ -1,3 +1,5 @@
++import { streamPauseMeter } from './streamPause.js';
++import { runCachedTailScenario, validateCachedTail } from './CachedTailBench.js';
+ /**
+  * DecodeBench — concurrent streaming decode throughput benchmark.
+  *
+@@ -21,6 +23,7 @@ import { fileURLToPath } from "url";
+ import { atomicWrite } from "../util/atomicWrite.js";
+ import {
+   applyThinkingFlags,
++  estimateTokenCount,
+   mean,
+   median,
+   round2,
+@@ -43,7 +46,7 @@ import {
+   formatContextSize,
+   parseContextSize,
+ } from "../../src/shared/prefillBench.js";
+-import { assessContextCache, buildContextPrompt, timeoutMsForSize } from "./contextFill.js";
++import { assessContextCache, buildContextPrompt, fillerText, timeoutMsForSize } from "./contextFill.js";
+ 
+ const __filename = fileURLToPath(import.meta.url);
+ const __dirname = path.dirname(__filename);
+@@ -67,12 +70,151 @@ const MAX_MAX_TOKENS = 2048;
+ const WARMUP_MAX_TOKENS = 32;
+ const PER_REQUEST_TIMEOUT_MS = 360_000;
+ const WAVE_TIMEOUT_MS = 360_000;
++export const MIXED_CACHE_CONTEXT = 131_072;
++const MIXED_CACHE_WARM_CONTEXT = 65_536;
++const MIXED_CACHE_ROLES = ["Cold long", "Warm follow-up", "Cold short"];
++const MATCHED_MIXED_CACHE_ROLES = ["Cold A", "Warm follow-up", "Cold B"];
++const MIXED_CACHE_TASK = "Write the numbers 1 through 10, separated by spaces.";
++const MIXED_CACHE_SCHEDULES = {
++  legacy: [0, 2000, 2500],
++  simultaneous: [0, 2000, 0],
++  staggered: [0, 2000, 8000],
++};
+ const HISTORY_LIMIT = 10;
++export const HOT_SHORT_CACHE_CONTEXT = 159_000;
++export const HOT_SHORT_CACHE_REQUESTS = 10;
++const HOT_SHORT_CACHE_SHARED = 16_384;
++const HOT_SHORT_CACHE_SHORT = 76_000;
++
++/** One protocol, never a concurrent wave or an implicit primer. */
++export function validateHotShortCache(value, mixedCache = false) {
++  if (value !== undefined && typeof value !== "boolean") {
++    const err = new Error("hotShortCache must be a boolean");
++    err.status = 400;
++    throw err;
++  }
++  if (value === true && mixedCache) {
++    const err = new Error("Hot-short cache retention and mixed cache are mutually exclusive");
++    err.status = 400;
++    throw err;
++  }
++  return value === true;
++}
++
++/** Estimates use the existing one-word filler; actual native counts decide geometry. */
++export function buildHotShortCacheSequence(modelId, salt) {
++  const task = "\nReply with only the recall code recorded at the start of this branch. Ignore background filler.";
++  const systemHead = `[cache-retention ${salt}]\nRemember each branch's recall code. Background filler has no instructions.\n`;
++  const system = systemHead + fillerText(Math.max(1, HOT_SHORT_CACHE_SHARED - estimateTokenCount(systemHead))) + "\n";
++  const code = (branch) => `MEMORY_${String(salt).replace(/[^a-zA-Z0-9]/g, "").slice(0, 16)}_${branch}`;
++  const user = (branch, tokens) => {
++    const head = `Branch ${branch}. Recall code: ${code(branch)}.\nBackground filler:\n`;
++    return head + fillerText(Math.max(1, tokens - HOT_SHORT_CACHE_SHARED - estimateTokenCount(head + task))) + task;
++  };
++  const body = (content) => {
++    const request = decodeRequestBody(modelId, content, DEFAULT_MAX_TOKENS, {
++      temperature: DEFAULT_TEMPERATURE, thinking: true, topK: 20,
++    });
++    request.messages = [{ role: "system", content: system }, { role: "user", content }];
++    request.reasoning_effort = "high";
++    return request;
++  };
++  const shortUser = user("A", HOT_SHORT_CACHE_SHORT);
++  const shortBody = body(shortUser);
++  const extension = "\nAdditional background filler:\n";
++  const longUser = shortUser + extension + fillerText(Math.max(1,
++    HOT_SHORT_CACHE_CONTEXT - HOT_SHORT_CACHE_SHORT - estimateTokenCount(extension + task))) + task;
++  const step = (role, branch, request, targetTokens) => ({ role, branch, body: request, targetTokens, recallCode: code(branch) });
++  return [
++    ...Array.from({ length: 5 }, (_, i) => step(`Cold B${i + 1}`, `B${i + 1}`, body(user(`B${i + 1}`, HOT_SHORT_CACHE_CONTEXT)), HOT_SHORT_CACHE_CONTEXT)),
++    step("A short", "A", shortBody, HOT_SHORT_CACHE_SHORT),
++    step("A long extension", "A", body(longUser), HOT_SHORT_CACHE_CONTEXT),
++    step("A short refresh", "A", shortBody, HOT_SHORT_CACHE_SHORT),
++    step("Cold C pressure", "C", body(user("C", HOT_SHORT_CACHE_CONTEXT)), HOT_SHORT_CACHE_CONTEXT),
++    step("A short replay", "A", shortBody, HOT_SHORT_CACHE_SHORT),
++  ];
++}
++
++export async function runHotShortCacheSequence({ baseUrl, modelId, contextSalt = randomUUID(), abortSignal, apiKey = null, onStep = null }) {
++  const steps = buildHotShortCacheSequence(modelId, contextSalt);
++  const started = performance.now();
++  const streams = [];
++  for (const [index, step] of steps.entries()) {
++    if (abortSignal?.aborted) break;
++    onStep?.(index, steps.length, step.role);
++    const ctrl = new AbortController();
++    const abort = () => ctrl.abort();
++    abortSignal?.addEventListener("abort", abort, { once: true });
++    const timer = setTimeout(abort, timeoutMsForSize(step.targetTokens));
++    const probeStartedAt = Date.now();
++    try {
++      // Debug retains reported usage internally; only the numeric projection below is published.
++      const result = await runStreamingRequest(`${baseUrl}/v1/chat/completions`, step.body, ctrl.signal, {
++        debug: true, collectContent: true, retryOnThinking400: false, thinking: true, apiKey,
++      });
++      const stream = streamPublicResult(result, index, null, null, false);
++      const actualPrompt = result.usage?.promptTokens;
++      stream.probeRole = step.role;
++      stream.probeStartedAt = probeStartedAt;
++      stream.probeFinishedAt = Date.now();
++      stream.targetPromptTokens = step.targetTokens;
++      stream.reportedPromptTokens = Number.isSafeInteger(actualPrompt) && actualPrompt > 0 ? actualPrompt : null;
++      stream.prefillTokens = stream.reportedPromptTokens ?? 0;
++      if (!result.cachedPromptTokensReported) delete stream.cachedTokens;
++      stream.contextCache = assessContextCache({ promptTokens: stream.reportedPromptTokens, cachedTokens: result.cachedPromptTokensReported ? result.cachedPromptTokens : null });
++      stream.recallPassed = result.error || !result.answer?.trim() ? null : result.answer.trim() === step.recallCode;
++      streams.push(stream);
++      if (result.error || !result.completionTokens) {
++        stream.error = result.error ? "Request failed" : "No complete reply";
++        break;
++      }
++    } catch (err) {
++      streams.push({ ...streamPublicResult(null, index, null, null), probeRole: step.role,
++        probeStartedAt, probeFinishedAt: Date.now(),
++        reportedPromptTokens: null, cachedTokens: undefined, recallPassed: null, contextCache: "unknown", error: err?.message || "Request failed" });
++      break;
++    } finally {
++      clearTimeout(timer);
++      abortSignal?.removeEventListener("abort", abort);
++    }
++  }
++  const refresh = streams[7];
++  const replay = streams[9];
++  const reported = streams.length === HOT_SHORT_CACHE_REQUESTS && streams.every((s) =>
++    !s.error && Number.isSafeInteger(s.reportedPromptTokens) && Number.isSafeInteger(s.cachedTokens) &&
++    s.cachedTokens >= 0 && s.cachedTokens <= s.reportedPromptTokens);
++  const hotShortRetention = !reported ? "unknown" : replay.cachedTokens > HOT_SHORT_CACHE_SHARED &&
++    replay.cachedTokens === refresh.cachedTokens ? "matched" : "different";
++  const failed = streams.filter((s) => s.error);
++  const durationMs = round2(performance.now() - started);
++  onStep?.(streams.length, steps.length, null);
++  return {
++    ...emptyWaveResult(1, durationMs, [], modelId, null),
++    hotShortCache: true, hotShortRetention, sharedTargetTokens: HOT_SHORT_CACHE_SHARED,
++    expectedRequests: HOT_SHORT_CACHE_REQUESTS, streams,
++    streamsOk: streams.filter((s) => !s.error).length,
++    streamsFailed: failed.length,
++    totalCompletionTokens: streams.reduce((n, s) => n + s.completionTokens, 0),
++    totalDecodeTokens: streams.reduce((n, s) => n + s.decodeTokens, 0),
++    totalPrefillTokens: streams.reduce((n, s) => n + (s.reportedPromptTokens ?? 0), 0),
++    meanTtftMs: round2(mean(streams.map((s) => s.ttftMs))),
++    error: streams.length !== HOT_SHORT_CACHE_REQUESTS || failed.length ? "Hot-short sequence did not complete all ten requests" : null,
++    warning: `${hotShortRetention === "matched" ? "Deep replay matched the refresh." : hotShortRetention === "different" ? "Replay did not retain the refresh's deep cached prefix." : "Cache-retention measurement is unknown."} Native token geometry and budget-pressure/eviction evidence must be checked separately.${streams.some((s) => s.recallPassed !== true) ? " Sentinel recall was not verified for every step." : ""}`,
++  };
++}
+ /** Hardware sample cadence while a concurrency wave runs (debug timeline). */
+ const HARDWARE_SAMPLE_MS = 1_000;
+ /** Cap samples per wave so history stays bounded (~2 min). */
+ const HARDWARE_SAMPLE_MAX = 120;
+ 
++export function validateMixedCacheArrival(value, mixedCache) {
++  if (value === undefined) return undefined;
++  if (mixedCache === true && (value === "simultaneous" || value === "staggered")) return value;
++  const err = new Error("mixedCacheArrival requires mixedCache and must be simultaneous or staggered");
++  err.status = 400;
++  throw err;
++}
++
+ /**
+  * Poll cached / fresh hardware while a wave runs (GPU util, temp, power, VRAM).
+  * @param {(() => Promise<object | null> | object | null) | null | undefined} sampleHardware
+@@ -303,6 +445,13 @@ function streamPublicResult(r, index, prompt, reqMeta, debug = false) {
+     prefillTokens: r?.prefillTokens ?? 0,
+     cachedTokens: r?.cachedPromptTokens ?? 0,
+     totalMs: r?.totalMs ?? 0,
++    lastTokenMs: r?.tLast == null || r.t0 == null ? null : round2(r.tLast - r.t0),
++    maxStreamEventGapMs: r?.maxStreamEventGapMs ?? null,
++    ...(r?.maxStreamEventGapStartMonotonicMs != null ? {
++      maxStreamEventGapStartMonotonicMs: r.maxStreamEventGapStartMonotonicMs,
++      maxStreamEventGapEndMonotonicMs: r.maxStreamEventGapEndMonotonicMs,
++    } : {}),
++    streamEventGapCount: r?.streamEventGapCount ?? 0,
+     error: r?.error ?? null,
+   };
+ 
+@@ -416,14 +565,31 @@ export async function runConcurrencyWave({
+   contextTokens = 0,
+   contextSalt = randomUUID(),
+   onPrefill = null,
++  mixedCache = false,
++  mixedCacheArrival,
+ }) {
++  const arrivalMode = validateMixedCacheArrival(mixedCacheArrival, mixedCache);
++  const schedule = mixedCache ? MIXED_CACHE_SCHEDULES[arrivalMode ?? "legacy"] : null;
+   const url = `${baseUrl}/v1/chat/completions`;
+   // `prompts` are the task prompts (what debug traces show); `sendPrompts` are what goes on the wire.
+   const prompts = pickBenchPrompts(concurrency, promptType);
+   const deep = contextTokens > 0;
+-  const sendPrompts = deep
+-    ? prompts.map((task, i) => buildContextPrompt(contextTokens, `${contextSalt}-${i}`, task))
+-    : prompts;
++  const warmPrompt = mixedCache
++    ? buildContextPrompt(MIXED_CACHE_WARM_CONTEXT, `${contextSalt}-warm`, "Reply with the word OK.")
++    : null;
++  const sendPrompts = mixedCache
++    ? [
++        buildContextPrompt(MIXED_CACHE_CONTEXT, `${contextSalt}-cold`, MIXED_CACHE_TASK),
++        `${warmPrompt}
++Follow-up: write the numbers 1 through 10, separated by spaces.`,
++        arrivalMode
++          ? buildContextPrompt(MIXED_CACHE_CONTEXT, `${contextSalt}-cold-b`, MIXED_CACHE_TASK)
++          : `[decode-context ${contextSalt}-short]
++${MIXED_CACHE_TASK}`,
++      ]
++    : deep
++      ? prompts.map((task, i) => buildContextPrompt(contextTokens, `${contextSalt}-${i}`, task))
++      : prompts;
+   const reqMeta = { url, modelId, maxTokens };
+ 
+   let fillResults = [];
+@@ -433,8 +599,8 @@ export async function runConcurrencyWave({
+     const fill = await prefillContexts({
+       baseUrl,
+       modelId,
+-      prompts: sendPrompts,
+-      contextTokens,
++      prompts: mixedCache ? [warmPrompt] : sendPrompts,
++      contextTokens: mixedCache ? MIXED_CACHE_WARM_CONTEXT : contextTokens,
+       abortSignal,
+       apiKey,
+       temperature,
+@@ -448,13 +614,24 @@ export async function runConcurrencyWave({
+       const empty = emptyWaveResult(concurrency, 0, [], modelId, fill.error, prompts, debug);
+       empty.contextTokens = contextTokens;
+       empty.contextPrefillMs = contextPrefillMs;
++      if (mixedCache) {
++        empty.mixedCache = true;
++        if (arrivalMode) empty.mixedCacheArrival = arrivalMode;
++        empty.error = "Mixed-cache warmup failed";
++        empty.streams = [];
++      }
+       return empty;
+     }
+   }
+ 
+   const live = createLiveRate(concurrency, onLive);
+ 
++  // LlmStreaming uses performance.now() for received SSE deltas. Calibrate once
++  // per wave to the host's monotonic clock without calling it on every event.
++  const perfBefore = performance.now();
++  const hostMonotonicMs = Number(process.hrtime.bigint()) / 1e6;
+   const wallStart = performance.now();
++  const monotonicOffsetMs = hostMonotonicMs - (perfBefore + wallStart) / 2;
+ 
+   // Poll /metrics like the live panel while streams run (steady-state gen tok/s)
+   const hwPollAbort = new AbortController();
+@@ -470,6 +647,7 @@ export async function runConcurrencyWave({
+     : Promise.resolve([]);
+ 
+   const controllers = [];
++  const arrivals = [];
+ 
+   const promises = Array.from({ length: concurrency }, (_, streamIndex) => {
+     const ctrl = new AbortController();
+@@ -483,22 +661,21 @@ export async function runConcurrencyWave({
+ 
+     const body = {
+       ...decodeRequestBody(modelId, sendPrompts[streamIndex], maxTokens, { temperature, thinking, topK }),
+-      min_tokens: maxTokens,
+-      ignore_eos: true,
+-      stop: [],
++      ...(mixedCache ? {} : { min_tokens: maxTokens, ignore_eos: true, stop: [] }),
+     };
+ 
++    const pause = streamPauseMeter();
+     const streamOpts = {
+-      debug,
+-      retryOnThinking400: true,
+-      thinking,
+-      apiKey,
+-      onDelta: (d) => live.note(streamIndex, d?.tokenCount),
++      debug: debug && !mixedCache, retryOnThinking400: true, thinking, apiKey,
++      onDelta: (d) => { live.note(streamIndex, d?.tokenCount); pause.note(d); },
+     };
+ 
+     return (async () => {
+       const timeout = setTimeout(() => ctrl.abort(), PER_REQUEST_TIMEOUT_MS);
+       try {
++        const delay = schedule?.[streamIndex] ?? 0;
++        if (delay > 0) await sleep(delay, ctrl.signal);
++        arrivals[streamIndex] = performance.now();
+         let result = await runStreamingRequest(url, body, ctrl.signal, streamOpts);
+         if (
+           result.error &&
+@@ -512,7 +689,13 @@ export async function runConcurrencyWave({
+             streamOpts
+           );
+         }
+-        return result;
++        return {
++          ...result,
++          ...pause.result(monotonicOffsetMs),
++        };
++      } catch (error) {
++        if (!mixedCache || error?.name !== "AbortError") throw error;
++        return { error: "Cancelled before request arrival" };
+       } finally {
+         clearTimeout(timeout);
+         if (abortSignal) abortSignal.removeEventListener("abort", onParentAbort);
+@@ -553,6 +736,12 @@ export async function runConcurrencyWave({
+       debug
+     );
+     if (debug) empty.hardwareSamples = hardwareSamples;
++    if (mixedCache) {
++      empty.mixedCache = true;
++      if (arrivalMode) empty.mixedCacheArrival = arrivalMode;
++      empty.error = "Mixed-cache wave timed out";
++      empty.streams = [];
++    }
+     if (deep) {
+       empty.contextTokens = contextTokens;
+       empty.contextPrefillMs = contextPrefillMs;
+@@ -560,8 +749,9 @@ export async function runConcurrencyWave({
+     return empty;
+   }
+ 
+-  const ok = results.filter((r) => !r.error && r.decodeTokens > 0);
+-  const failed = results.filter((r) => r.error || r.decodeTokens <= 0);
++  const passed = (r) => !r.error && (mixedCache ? r.ttftContentMs != null && r.finishReason === "stop" : r.decodeTokens > 0);
++  const ok = results.filter(passed);
++  const failed = results.filter((r) => !passed(r));
+   const decodeTpsList = ok.map((r) => r.decodeTps);
+   const ttftList = ok.map((r) => r.ttftMs);
+   const prefillTpsList = ok.map((r) => r.prefillTps).filter((n) => n > 0);
+@@ -620,19 +810,47 @@ export async function runConcurrencyWave({
+         ? `${failed.length} of ${concurrency} streams failed`
+         : null,
+     streams: results.map((r, i) =>
+-      streamPublicResult(r, i, prompts[i], reqMeta, debug)
++      streamPublicResult(r, i, prompts[i], reqMeta, debug && !mixedCache)
+     ),
+     model,
+   };
+   if (debug) wave.hardwareSamples = hardwareSamples;
+-  if (deep) {
++  if (mixedCache) {
++    const coldFirst = results[0]?.tFirst;
++    const overlap = Number.isFinite(coldFirst) &&
++      arrivals[1] < coldFirst && arrivals[2] < coldFirst;
++    const matchedOrder = arrivalMode === "simultaneous"
++      ? arrivals[2] < arrivals[1] && arrivals[1] < results[2]?.tFirst
++      : arrivalMode !== "staggered" || arrivals[1] < arrivals[2];
++    wave.mixedCache = true;
++    if (arrivalMode) wave.mixedCacheArrival = arrivalMode;
++    if (failed.length) wave.error = `${failed.length} of ${concurrency} probe requests failed or ended without a complete reply`;
++    wave.streams.forEach((stream, i) => {
++      stream.probeRole = (arrivalMode ? MATCHED_MIXED_CACHE_ROLES : MIXED_CACHE_ROLES)[i];
++      stream.probeArrivalMs = Number.isFinite(arrivals[i]) ? round2(arrivals[i] - wallStart) : null;
++      if (arrivalMode) stream.probeScheduledArrivalMs = schedule[i];
++      const result = results[i];
++      if (!result?.cachedPromptTokensReported) delete stream.cachedTokens;
++      if (!passed(result)) stream.error = result.error ? "Request failed" : "No complete reply";
++      stream.contextCache = assessContextCache({
++        promptTokens: result?.prefillTokens,
++        cachedTokens: result?.cachedPromptTokensReported ? result.cachedPromptTokens : null,
++      });
++    });
++    if (!overlap || !matchedOrder || wave.streams[0].contextCache !== "uncached" ||
++        wave.streams[1].contextCache !== "cached" || wave.streams[2].contextCache !== "uncached") {
++      wave.warning = arrivalMode
++        ? "Mixed-cache probe inconclusive. Expected a warm hit, two cold misses and the selected arrival overlap."
++        : "Mixed-cache probe inconclusive: expected a warm hit and two cold misses arriving before the long prompt's first token.";
++    }
++  } else if (deep) {
+     // A deep-context number only counts when the measured pass decoded from the prefilled KV.
+     const verdicts = results.map((r, i) =>
+       r.error
+         ? "unknown"
+         : assessContextCache({
+             promptTokens: r.prefillTokens,
+-            cachedTokens: r.cachedPromptTokens,
++            cachedTokens: r.cachedPromptTokensReported ? r.cachedPromptTokens : null,
+             ttftMs: r.ttftMs,
+             fillTtftMs: fillResults[i]?.ttftMs,
+           })
+@@ -651,7 +869,10 @@ export async function runConcurrencyWave({
+     });
+     const bad = count("partial") + count("uncached");
+     if (bad > 0) {
+-      wave.warning = `${bad} of ${concurrency} streams re-prefilled part of the ${formatContextSize(contextTokens)} context (prefix cache miss), so their tok/s is not a clean deep-context decode. Enable prefix caching or raise its capacity.`;
++      wave.warning = `${bad} of ${concurrency} streams re-prefilled part of the ${formatContextSize(contextTokens)} context (prefix cache miss), so their tok/s is not a clean deep-context decode.`;
++    }
++    if (count("unknown") > 0) {
++      wave.warning = [wave.warning, "Cache reuse is unreported; warm-context decode is unverified."].filter(Boolean).join(" ");
+     }
+   }
+   return wave;
+@@ -946,6 +1167,8 @@ export class DecodeBenchManager {
+    *   promptType?: string,
+    *   temperature?: number,
+    *   thinking?: boolean,
++   *   mixedCache?: boolean,
++   *   mixedCacheArrival?: "simultaneous" | "staggered",
+    *   debug?: boolean,
+    *   sampleHardware?: (() => Promise<object | null> | object | null) | null,
+    *   apiKey?: string | null,
+@@ -969,6 +1192,10 @@ export class DecodeBenchManager {
+       temperature: rawTemp,
+       thinking: rawThinking,
+       contextTokens: rawContext,
++      mixedCache = false,
++      mixedCacheArrival,
++      hotShortCache: rawHotShortCache,
++      cachedTail: rawCachedTail,
+       debug = false,
+       sampleHardware = null,
+       apiKey = null,
+@@ -984,17 +1211,48 @@ export class DecodeBenchManager {
+       throw err;
+     }
+ 
+-    const concurrencies = normalizeConcurrencies(rawConc);
++    validateMixedCacheArrival(mixedCacheArrival, mixedCache);
++    const hotShortCache = validateHotShortCache(rawHotShortCache, mixedCache);
++    const cachedTail = validateCachedTail(rawCachedTail, mixedCache, hotShortCache);
++    if (cachedTail && backend !== "tensorfold") throw new Error("Cached-tail requires local TensorFold");
++    let branchPrior = null;
++    if (cachedTail === "branch-resume") {
++      const prior = this.getHistory(sparkId).find(j => j.config?.cachedTail === "branch" && j.config.port === Number(port) && j.config.modelId === modelId);
++      const samples = prior?.results?.flatMap(w => w.samples ?? []).filter(s => !s.discarded && s.traffic?.discarded === false && s.traffic?.submitted === 3 && Number.isFinite(s.branchCachedTokens)) ?? [];
++      if (!prior || samples.length === 0 || samples.length >= 6 || Date.now() - prior.completedAt > 3600000) throw new Error("No recent partially completed branch measurement to resume");
++      branchPrior = { benchId: prior.benchId, samples };
++    }
++    if (cachedTail === "pause" && !this.getHistory(sparkId).some(j =>
++      j.status === "completed" && j.config?.cachedTail === "replay" && j.config.port === Number(port) &&
++      j.config.modelId === modelId && Date.now() - j.completedAt < 3600000 &&
++      j.results?.some(w => !w.error && w.samples?.length === 3 && w.samples.every(s => s.reproduced === true)))) {
++      const err = new Error("Run a successful three-sample original replay on this model/port within the last hour first"); err.status = 400; throw err;
++    }
++    if (cachedTail === "pause-candidate" && !this.getHistory(sparkId).some(j =>
++      j.status === "completed" && !j.error && j.config?.cachedTail === "replay-candidate" && j.config.port === Number(port) &&
++      j.config.modelId === modelId && Number.isFinite(j.completedAt) && Date.now() - j.completedAt >= 0 && Date.now() - j.completedAt < 3600000 &&
++      j.results?.some(w => !w.error && w.samples?.length === 3 && w.samples.every(s =>
++        s.comparisonValid === true && !s.discarded && s.traffic?.discarded === false && s.traffic?.submitted === 5)))) {
++      const err = new Error("Run a successful three-sample candidate replay on this model/port within the last hour first"); err.status = 400; throw err;
++    }
++    const pauseScenario = cachedTail === "pause" || cachedTail === "pause-candidate";
++    const admissionScenario = cachedTail === "admission";
++    if (hotShortCache && backend !== "tensorfold") {
++      const err = new Error("Hot-short cache retention requires a monitored local TensorFold model");
++      err.status = 400;
++      throw err;
++    }
++    const concurrencies = cachedTail ? [admissionScenario ? 4 : pauseScenario ? 8 : 1] : hotShortCache ? [1] : normalizeConcurrencies(rawConc);
+     if (!concurrencies.length) {
+       const err = new Error("Select at least one concurrency level (1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, or 32)");
+       err.status = 400;
+       throw err;
+     }
+ 
+-    let maxTokens = Number(rawMax);
++    let maxTokens = admissionScenario ? 32768 : Number(rawMax);
+     if (!Number.isFinite(maxTokens)) maxTokens = DEFAULT_MAX_TOKENS;
+     maxTokens = Math.round(maxTokens);
+-    if (maxTokens < MIN_MAX_TOKENS || maxTokens > MAX_MAX_TOKENS) {
++    if (!admissionScenario && (maxTokens < MIN_MAX_TOKENS || maxTokens > MAX_MAX_TOKENS)) {
+       const err = new Error(`maxTokens must be between ${MIN_MAX_TOKENS} and ${MAX_MAX_TOKENS}`);
+       err.status = 400;
+       throw err;
+@@ -1026,6 +1284,12 @@ export class DecodeBenchManager {
+     const promptType = normalizeDecodeBenchType(rawType);
+     const thinking =
+       rawThinking == null ? DEFAULT_THINKING : rawThinking === true || rawThinking === "true";
++    if (hotShortCache && (maxTokens !== 400 || temperature !== 0.7 || !thinking)) {
++      const err = new Error("Hot-short cache retention requires 400 output tokens, temperature 0.7 and thinking on");
++      err.status = 400;
++      throw err;
++    }
++    if (hotShortCache) contextTokens = HOT_SHORT_CACHE_CONTEXT;
+     const debugOn = Boolean(debug);
+     const benchId = randomUUID();
+     const abort = new AbortController();
+@@ -1039,11 +1303,17 @@ export class DecodeBenchManager {
+         port: p,
+         modelId: modelId || null,
+         concurrencies,
+-        maxTokens,
++        maxTokens: admissionScenario ? 32768 : cachedTail ? (pauseScenario ? 2048 : 8) : maxTokens,
++        ...(cachedTail ? { cachedTail } : {}),
++        ...(mixedCache ? { mixedCache: true } : {}),
++        ...(hotShortCache ? { hotShortCache: true } : {}),
++        ...(hotShortCache ? { reasoningEffort: "high" } : {}),
++        ...(mixedCacheArrival ? { mixedCacheArrival } : {}),
+         promptType,
+-        temperature,
+-        thinking,
+-        ...(backend === "tensorfold" ? { topK: 20 } : {}),
++        temperature: admissionScenario ? 0.7 : cachedTail ? 0 : temperature,
++        ...(cachedTail ? { ...(branchPrior ? { branchPrior } : {}), scenarioProtocol: cachedTail.startsWith("branch") ? "branch-retention-streaming-v1" : "replay3-streaming-v1", probeMaxTokens: 8, decoderMaxTokens: pauseScenario ? 2048 : null, thinkingSource: "unchanged server default High" } : { thinking }),
++        ...(backend === "tensorfold" && !cachedTail ? { topK: 20 } : {}),
++        ...(admissionScenario ? { scenarioProtocol: "admission-natural-eos-v1", probeMaxTokens: 8, maxTokens: 32768, naturalCompletion: true, reasoningEffort: "high", thinkingSource: "explicit scenario High", topK: 20, thinking: true } : {}),
+         ...(contextTokens > 0 ? { contextTokens } : {}),
+         ...(debugOn ? { debug: true } : {}),
+         ...(rawHost
+@@ -1091,7 +1361,7 @@ export class DecodeBenchManager {
+   }
+ 
+   async _runJob(job, lanIp) {
+-    const debug = Boolean(job._debug);
++    const debug = Boolean(job._debug) && !job.config.mixedCache && !job.config.hotShortCache && !job.config.cachedTail;
+     let host = lanIp;
+     let port = job.config.port;
+     let tls = Boolean(job.config.tls);
+@@ -1115,7 +1385,7 @@ export class DecodeBenchManager {
+         }
+       }
+       const baseUrl = formatLlmBaseUrl({ host, port, tls });
+-      if (!job._abort.signal.aborted) {
++      if (!job._abort.signal.aborted && !job.config.mixedCache && !job.config.hotShortCache && !job.config.cachedTail) {
+         if (!String(job.progress.message || "").startsWith("Warming up")) {
+           job.progress.message = "Warming up…";
+         }
+@@ -1146,7 +1416,19 @@ export class DecodeBenchManager {
+         job.progress.message = `Running concurrency ${c}…`;
+         this._checkpointActive();
+ 
+-        const wave = await runConcurrencyWave({
++        const wave = job.config.cachedTail ? await runCachedTailScenario({
++          baseUrl, modelId: job.config.modelId, mode: job.config.cachedTail, salt: job.benchId,
++          abortSignal: job._abort.signal, apiKey: job._apiKey, branchPrior: job.config.branchPrior,
++          onStep: message => { job.progress.message = message; this._checkpointActive(); },
++        }) : job.config.hotShortCache ? await runHotShortCacheSequence({
++          baseUrl, modelId: job.config.modelId, contextSalt: job.benchId,
++          abortSignal: job._abort.signal, apiKey: job._apiKey,
++          onStep: (done, total, role) => {
++            job.progress.prefill = { done, total };
++            job.progress.message = role ? `Hot-short cache retention ${done + 1}/${total}: ${role}` : "Hot-short cache retention finished";
++            this._checkpointActive();
++          },
++        }) : await runConcurrencyWave({
+           baseUrl,
+           modelId: job.config.modelId,
+           concurrency: c,
+@@ -1161,12 +1443,17 @@ export class DecodeBenchManager {
+           topK: job.config.topK,
+           contextTokens: job.config.contextTokens || 0,
+           contextSalt: job.benchId,
++          mixedCache: job.config.mixedCache,
++          mixedCacheArrival: job.config.mixedCacheArrival,
+           onPrefill: (done, total) => {
+             job.progress.prefill = { done, total };
+-            job.progress.message =
+-              done < total
++            if (job.config.mixedCache) {
++              job.progress.message = done < total ? "Warming the 64k prefix…" : "Running the mixed-cache arrivals…";
++            } else {
++              job.progress.message = done < total
+                 ? `Prefilling ${formatContextSize(job.config.contextTokens)} context ${done + 1}/${total} for ×${c}…`
+                 : `Running concurrency ${c}…`;
++            }
+             this._checkpointActive();
+           },
+           onLive: (tps) => {
+@@ -1177,7 +1464,7 @@ export class DecodeBenchManager {
+ 
+         if (job._abort.signal.aborted) {
+           // Keep partial wave only if it fully succeeded before cancel
+-          if (wave.streamsOk > 0 && !wave.error) {
++          if ((wave.streamsOk > 0 && !wave.error) || ((job.config.hotShortCache || job.config.cachedTail) && wave.streams.length > 0)) {
+             job.results.push(wave);
+             job.progress.completedLevels += 1;
+           }
+@@ -1196,6 +1483,12 @@ export class DecodeBenchManager {
+         job.results.push(wave);
+         job.progress.completedLevels += 1;
+         this._checkpointActive();
++        if ((job.config.hotShortCache || job.config.cachedTail) && wave.error) {
++          job.status = "failed";
++          job.error = wave.error;
++          job.progress.message = "Failed";
++          break;
++        }
+       }
+ 
+       if (job.status === "running") {
+diff --git a/server/collectors/LlmProbe.js b/server/collectors/LlmProbe.js
+index 6e2b00f03f0c7fa023bf48c09f0b31f7b485821b..2401f0767e5187af2e4bc834d471ee1a66f7a63c 100644
+--- a/server/collectors/LlmProbe.js
++++ b/server/collectors/LlmProbe.js
+@@ -9,6 +9,7 @@ import { classifyHostScope } from "../validate.js";
+ import { llmProbeHost } from "./llmHost.js";
+ import { openSshLlmTunnel } from "./llmTunnel.js";
+ import { applyThinkingFlags } from "./LlmStreaming.js";
++import { parseNativeTensorFoldCapacity } from "./tensorfoldCapacity.js";
+ 
+ const FAIL_RESET_THRESHOLD = 3;
+ /** Direct failures in a row before the probe tries an SSH tunnel to the unit's loopback. */
+@@ -148,6 +149,9 @@ export class LlmProbe {
+     this._streamSampleNow = typeof options.now === "function" ? options.now : Date.now;
+     this._streamSampleLastAt = 0;
+     this._streamSampleBusy = false;
++    this._nativeCapacityRequest = 0;
++    this._readNativeSharedPool = typeof options.readNativeSharedPool === "function"
++      ? options.readNativeSharedPool : null;
+     /** The unit's own address; baseUrl switches to a local forward when only SSH reaches the engine. */
+     this._directBase = `http://${llmProbeHost(spark)}:${port}`;
+     this.baseUrl = this._directBase;
+@@ -268,6 +272,8 @@ export class LlmProbe {
+      * prefill counter is computed-only, so prompt = computed + cached).
+      */
+     this.totalCachedTokens = null;
++    /** Optional covered-input denominator; undefined = legacy full-scope cache counter. */
++    this.totalCacheMeasuredPromptTokens = undefined;
+     /**
+      * TensorFold live prompt-position gauge (`tensorfold:prefill_progress_tokens`):
+      * tokens of the prompt currently being prefilled. null when the build does not
+@@ -444,6 +450,7 @@ export class LlmProbe {
+     this.decodeActive = false;
+     this.generationTpsSource = null;
+     this.prefillActive = false;
++    if (this.backendType === "tensorfold") this._clearKvPool();
+     if (this.backendType === "strata") this._clearStrataRates();
+     try {
+       const shouldDetect =
+@@ -580,6 +587,7 @@ export class LlmProbe {
+     this.totalOutputTokens = 0;
+     this.totalPromptTokens = null;
+     this.totalCachedTokens = null;
++    this.totalCacheMeasuredPromptTokens = undefined;
+     this.prefillProgressTokens = null;
+     this.generationProgressTokens = null;
+     this.kvCacheUsage = null;
+@@ -1146,6 +1154,7 @@ export class LlmProbe {
+           this._applyTensorFoldHealth(health, dtSec);
+           this._applyTensorFoldCache(health?.live?.cache);
+           this._applyTensorFoldLive(health);
++          await this._refreshNativeSharedPool(health);
+           // TensorFold's open /health names the release when the build carries one
+           // (zig/src/server/identity.zig; status_routes.zig's openHealth). Older builds
+           // omit the field, so it stays null rather than being inferred from a model name.
+@@ -2209,7 +2218,7 @@ export class LlmProbe {
+     // TensorFold 0.5.0 (cuda/health.py) publishes cumulative cached prompt tokens
+     // alongside the EXL3-style counters; older builds omit it (stays null).
+     const cached = health.cached_tokens_total == null ? NaN : Number(health.cached_tokens_total);
+-    if (Number.isFinite(cached) && cached >= 0) this.totalCachedTokens = cached;
++    this._applyTensorFoldCacheCounters(prompt, cached, health.cache_measured_prompt_tokens_total);
+     this._tensorfoldPrevCached = Number.isFinite(cached) && cached >= 0 ? cached : null;
+     const batch = Number(health.max_batch_size);
+     if (Number.isFinite(batch) && batch > 0) this.slotsTotal = Math.round(batch);
+@@ -2240,12 +2249,7 @@ export class LlmProbe {
+     this.slotsActive = this.requestsRunning;
+     // 0.6.0 CUDA sizes its KV pool in tokens: `pool_tokens` in all,
+     // `pool_free_tokens` not held by a request (kept prompts count as held).
+-    const pool = count(health.pool_tokens);
+-    const poolFree = count(health.pool_free_tokens);
+-    if (Number.isFinite(pool) && pool > 0 && Number.isFinite(poolFree) && poolFree >= 0) {
+-      const used = 1 - Math.min(poolFree, pool) / pool;
+-      this.kvCacheUsage = Math.round(used * 10000) / 10000;
+-    }
++    this._applyTensorFoldPool(health);
+     if (!Number.isFinite(prefillSec) || !Number.isFinite(prompt)) return;
+     if (prevPrefillSec == null) {
+       this._tensorfoldPrefillSeconds = prefillSec;
+@@ -2275,6 +2279,116 @@ export class LlmProbe {
+     this._tensorfoldPrefillSeconds = prefillSec;
+   }
+ 
++  _tensorFoldCapacityTarget() {
++    return JSON.stringify([this.port, this.baseUrl, this.spark?.id, this.spark?.isLocal,
++      this.spark?.platform, this.spark?.lanIp, this.spark?.llmHost,
++      this.spark?.ssh?.host, this.spark?.ssh?.user, this.spark?.ssh?.port]);
++  }
++
++  _tensorFoldHealthReady(health) {
++    return health && typeof health === "object" && !Array.isArray(health) &&
++      (health.status == null || health.status === "ok") &&
++      (health.ok == null || health.ok === true) &&
++      (health.status === "ok" || health.ok === true) && health.warming !== true;
++  }
++
++  /** Explicit shared-pool counts only; a generic context window is not capacity. */
++  _tensorFoldPoolObservation(health) {
++    if (!this._tensorFoldHealthReady(health)) return null;
++    const integer = (v) => {
++      if (typeof v !== "number" && typeof v !== "string") return null;
++      if (typeof v === "string" && !v.trim()) return null;
++      const n = Number(v);
++      return Number.isSafeInteger(n) && n >= 0 ? n : null;
++    };
++    const pool = integer(health?.pool_tokens);
++    if (!(pool > 0)) return null;
++    const rawFree = integer(health?.pool_free_tokens);
++    const free = rawFree != null && rawFree <= pool ? rawFree : null;
++    return { capacityTokens: pool, contextTokens: null, availableTokens: free,
++      source: "tensorfold-health-pool", observedAt: Date.now() };
++  }
++
++  _applyTensorFoldPool(health) {
++    this._clearKvPool();
++    const pool = this._tensorFoldPoolObservation(health);
++    if (!pool) return;
++    this.kvCacheTokens = pool.capacityTokens;
++    this.kvCacheTokensSource = pool.source;
++    this.kvCacheTokensObservedAt = pool.observedAt;
++    if (pool.availableTokens != null) {
++      this.kvCacheTokensAvailable = pool.availableTokens;
++      this.kvCacheUsage = Math.round((1 - pool.availableTokens / pool.capacityTokens) * 10000) / 10000;
++    }
++  }
++
++  /** Qualify logical context independently; legacy builds also need physical capacity. */
++  async _refreshNativeSharedPool(health) {
++    const pool = this._tensorFoldPoolObservation(health);
++    if (!this._readNativeSharedPool ||
++        String(this.spark?.llmHost || "").trim() ||
++        (Object.hasOwn(health || {}, "pool_tokens") && !pool) ||
++        health?.status !== "ok" || health?.warming !== false) return;
++    const target = this._tensorFoldCapacityTarget();
++    const spark = this.spark;
++    const request = ++this._nativeCapacityRequest;
++    try {
++      const observation = parseNativeTensorFoldCapacity(await this._readNativeSharedPool(this.port));
++      if (!observation || request !== this._nativeCapacityRequest ||
++          this.spark !== spark || this._tensorFoldCapacityTarget() !== target) return;
++      if (pool) {
++        if (observation.poolTokens !== pool.capacityTokens) return;
++        this._nativeContextTokens = observation.capacityTokens;
++        return; // health retains authority for physical capacity and free space
++      }
++      if (observation.poolTokens != null) return; // engine changed between reads
++      this.kvCacheTokens = observation.capacityTokens;
++      this._nativeContextTokens = observation.capacityTokens;
++      this.kvCacheTokensSource = observation.source;
++      this.kvCacheTokensObservedAt = observation.observedAt;
++      // Process arguments establish capacity, not current allocation/available space.
++      this.kvCacheTokensAvailable = null;
++    } catch {
++      // Missing host visibility does not turn an unknown pool into zero or a guess.
++    }
++  }
++
++  /**
++   * Fresh TensorFold capacity for policy consumers. Does not run generation or
++   * retain a previous process: every call re-reads health and, if needed, the
++   * native listener. Other engines retain their own capacity contracts.
++   */
++  async getSharedPoolCapacity() {
++    if (this.backendType !== "tensorfold" || this.authOpen === false) return null;
++    const target = this._tensorFoldCapacityTarget();
++    const spark = this.spark;
++    const auth = this.authOpen;
++    const readNative = this._readNativeSharedPool;
++    const current = () => this.backendType === "tensorfold" && this.authOpen !== false &&
++      this.authOpen === auth && this.spark === spark && this._tensorFoldCapacityTarget() === target &&
++      this._readNativeSharedPool === readNative;
++    try {
++      const res = await this._fetch(`${this.baseUrl}/health`);
++      if (!res.ok || !current()) return null;
++      const health = await res.json();
++      if (!current() || !this._tensorFoldHealthReady(health)) return null;
++      const pool = this._tensorFoldPoolObservation(health);
++      if (!readNative || String(spark?.llmHost || "").trim() ||
++          (Object.hasOwn(health, "pool_tokens") && !pool) || health.status !== "ok" || health.warming !== false) return pool;
++      const observation = parseNativeTensorFoldCapacity(await readNative(this.port));
++      if (!current()) return null;
++      if (pool) {
++        return observation?.poolTokens === pool.capacityTokens
++          ? { ...pool, contextTokens: observation.capacityTokens } : pool;
++      }
++      if (!observation || observation.poolTokens != null) return null;
++      return { capacityTokens: observation.capacityTokens, contextTokens: observation.capacityTokens,
++        availableTokens: null, source: observation.source, observedAt: observation.observedAt };
++    } catch {
++      return null;
++    }
++  }
++
+   /**
+    * Newer TensorFold builds put the server's own live rates in /health:
+    * `live: { decode_tokens_per_second, prefill_tokens_per_second, connections, waiting }`.
+@@ -2302,6 +2416,24 @@ export class LlmProbe {
+     }
+   }
+ 
++  /** Read one authoritative cache tuple, retaining whether subset scope is required. */
++  _applyTensorFoldCacheCounters(prompt, cached, measured) {
++    const count = (v) => v != null && Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : null;
++    const input = count(prompt);
++    const hit = count(cached);
++    const covered = count(measured);
++    const subsetScope = measured !== undefined || this.totalCacheMeasuredPromptTokens !== undefined;
++    if (subsetScope) {
++      // Covered requests can be a strict subset (for example, cancellation
++      // before an authoritative prefill event). Never clamp an invalid tuple.
++      const valid = input != null && hit != null && covered != null && hit <= covered && covered <= input;
++      this.totalCachedTokens = valid ? hit : null;
++      this.totalCacheMeasuredPromptTokens = valid ? covered : null;
++    } else {
++      this.totalCachedTokens = hit == null ? null : input == null ? hit : Math.min(hit, input);
++    }
++  }
++
+   /**
+    * ninfer: Prometheus-only engine (/metrics). Reads cumulative output tokens for the
+    * live tok/s rate, per-pool KV-cache usage, spec-decode acceptance per position, and
+@@ -2630,6 +2762,7 @@ export class LlmProbe {
+     // instead of a position measured by an earlier poll.
+     this.prefillProgressTokens = null;
+     this.generationProgressTokens = null;
++    if (!queueOnly) this._applyTensorFoldCacheCounters();
+     let txt;
+     try {
+       const res = await this._fetch(`${this.baseUrl}/metrics`);
+@@ -2655,7 +2788,7 @@ export class LlmProbe {
+     // TensorFold publishes the prompt-cache split of finished requests under one of
+     // several names (TENSORFOLD_CACHED_PROMPT_COUNTERS, in precedence order). Keep it
+     // from this scrape's prompt total and never let a cached count exceed the prompt it
+-    // belongs to. Builds that publish none of them leave the previous value alone.
++    // belongs to. A full scrape without a valid tuple leaves the split unknown.
+     let cachedTotal = null;
+     if (!queueOnly) {
+       for (const name of TENSORFOLD_CACHED_PROMPT_COUNTERS) {
+@@ -2666,10 +2799,7 @@ export class LlmProbe {
+         }
+       }
+     }
+-    if (cachedTotal != null) {
+-      this.totalCachedTokens =
+-        Number.isFinite(prompt) && prompt >= 0 ? Math.min(cachedTotal, prompt) : cachedTotal;
+-    }
++    if (!queueOnly) this._applyTensorFoldCacheCounters(prompt, cachedTotal, m("prompt_tokens_cache_measured_total") ?? undefined);
+     // The total moves only when a request finishes; `generation_tokens_running` counts the
+     // tokens of requests still decoding. Their sum grows steadily while tokens are produced
+     // (a finishing request moves its tokens from one to the other), so its diff is the live rate.
+@@ -3868,6 +3998,10 @@ export class LlmProbe {
+     this.kvCacheTokens = null;
+     this.kvCacheTokensAvailable = null;
+     this.kvCacheMemoryBytes = null;
++    this.kvCacheTokensSource = null;
++    this.kvCacheTokensObservedAt = null;
++    this._nativeContextTokens = null;
++    this._nativeCapacityRequest = (this._nativeCapacityRequest || 0) + 1;
+   }
+ 
+   /**
+@@ -4089,7 +4223,8 @@ export class LlmProbe {
+       models: metricsLive ? [...this.models] : [],
+       // Strata advertises aliases for one loaded engine, sharing its native
+       // context limit. Genuine multi-model routers still have no shared limit.
+-      contextLength: this.models.length > 1 && this.backendType !== "strata" ? null : this.contextLength,
++      contextLength: this._nativeContextTokens != null ? this._nativeContextTokens
++        : this.models.length > 1 && this.backendType !== "strata" ? null : this.contextLength,
+       gpuMemoryUtilization: this.gpuMemoryUtilization,
+       slotsActive: this.slotsActive,
+       slotsTotal: this.slotsTotal,
+@@ -4106,6 +4241,7 @@ export class LlmProbe {
+       totalOutputTokens: this.totalOutputTokens,
+       totalPromptTokens: this.totalPromptTokens ?? null,
+       totalCachedTokens: this.totalCachedTokens ?? null,
++      totalCacheMeasuredPromptTokens: this.totalCacheMeasuredPromptTokens,
+       prefillProgressTokens: this.backendType === "tensorfold" ? this.prefillProgressTokens ?? null : null,
+       generationProgressTokens: this.backendType === "tensorfold" ? this.generationProgressTokens ?? null : null,
+       kvCacheUsage: this.kvCacheUsage,
+@@ -4113,6 +4249,8 @@ export class LlmProbe {
+       cacheHistograms: this.cacheHistograms,
+       kvCacheTokens: this.kvCacheTokens,
+       kvCacheTokensAvailable: this.kvCacheTokensAvailable,
++      kvCacheTokensSource: this.kvCacheTokensSource ?? null,
++      kvCacheTokensObservedAt: this.kvCacheTokensObservedAt ?? null,
+       kvCacheMemoryBytes: this.kvCacheMemoryBytes,
+       kvCacheGb: this.kvCacheGb,
+       weightsGb: this.weightsGb,
+@@ -4165,6 +4303,8 @@ export class LlmProbe {
+       cacheHistograms: null,
+       kvCacheTokens: null,
+       kvCacheTokensAvailable: null,
++      kvCacheTokensSource: null,
++      kvCacheTokensObservedAt: null,
+       kvCacheMemoryBytes: null,
+       kvCacheGb: null,
+       weightsGb: null,
+diff --git a/server/collectors/LlmStreaming.js b/server/collectors/LlmStreaming.js
+index d9209a22b03b7ff7d8afb571a9c7bcf827145496..f745771b75d826b70dd27e41c86fa97df7112665 100644
+--- a/server/collectors/LlmStreaming.js
++++ b/server/collectors/LlmStreaming.js
+@@ -577,7 +577,9 @@ async function runStreamingRequestOnce(
+   let usageCompletionTokens = null;
+   let usagePromptTokens = null;
+   /** Prompt tokens served from the prefix cache (usage.prompt_tokens_details / llama.cpp timings). */
++  let tensorfold = null;
+   let cachedPromptTokens = 0;
++  let cachedPromptTokensReported = false;
+   /** Server-measured prompt-processing time, when the backend reports it (llama.cpp `timings`). */
+   let serverPromptMs = null;
+   let serverPromptN = null;
+@@ -668,6 +670,14 @@ async function runStreamingRequestOnce(
+ 
+           if (debug && json.id && !completionId) completionId = String(json.id);
+           if (json.model) model = json.model;
++          if (json.tensorfold && typeof json.tensorfold === "object") {
++            const tf = json.tensorfold;
++            tensorfold = {
++              tokenSha: typeof tf.token_sha === "string" && /^[a-f0-9]{12,64}$/.test(tf.token_sha) ? tf.token_sha : null,
++              ttftSeconds: Number.isFinite(tf.time_to_first_token) && tf.time_to_first_token >= 0 ? tf.time_to_first_token : null,
++              prefillSeconds: Number.isFinite(tf.prefill_seconds) && tf.prefill_seconds >= 0 ? tf.prefill_seconds : null,
++            };
++          }
+           if (json.usage && typeof json.usage === "object") {
+             usage = {
+               promptTokens: Number(json.usage.prompt_tokens) || 0,
+@@ -684,8 +694,12 @@ async function runStreamingRequestOnce(
+             if (json.usage.prompt_tokens != null) {
+               usagePromptTokens = Number(json.usage.prompt_tokens);
+             }
+-            const cached = Number(json.usage.prompt_tokens_details?.cached_tokens);
+-            if (Number.isFinite(cached) && cached > 0) cachedPromptTokens = Math.max(cachedPromptTokens, cached);
++            const rawCached = json.usage.prompt_tokens_details?.cached_tokens;
++            const cached = rawCached == null ? NaN : Number(rawCached);
++            if (Number.isFinite(cached) && cached >= 0) {
++              cachedPromptTokensReported = true;
++              cachedPromptTokens = Math.max(cachedPromptTokens, cached);
++            }
+           }
+           if (json.timings && typeof json.timings === "object") {
+             const ms = Number(json.timings.prompt_ms);
+@@ -694,14 +708,15 @@ async function runStreamingRequestOnce(
+               serverPromptMs = ms;
+               serverPromptN = n;
+             }
+-            const cacheN = Number(json.timings.cache_n);
+-            if (Number.isFinite(cacheN) && cacheN > 0) {
++            const cacheN = json.timings.cache_n == null ? NaN : Number(json.timings.cache_n);
++            if (Number.isFinite(cacheN) && cacheN >= 0) {
++              cachedPromptTokensReported = true;
+               cachedPromptTokens = Math.max(cachedPromptTokens, cacheN);
+             }
+           }
+ 
+           const choice = json.choices?.[0];
+-          if (debug && choice?.finish_reason) finishReason = String(choice.finish_reason);
++          if (choice?.finish_reason) finishReason = String(choice.finish_reason);
+ 
+           const { answer, reasoning, tokenChunks } = extractDeltaPieces(choice);
+           if (tokenChunks > 0) {
+@@ -784,6 +799,8 @@ async function runStreamingRequestOnce(
+     prefillTps: round2(prefillTps),
+     /** Prompt tokens the server reused from its prefix cache (0 when unknown/none). */
+     cachedPromptTokens,
++    cachedPromptTokensReported,
++    tensorfold,
+     /** Server-measured prompt processing (ms / tokens actually computed); null when not reported. */
+     serverPromptMs,
+     serverPromptN,
+@@ -793,6 +810,7 @@ async function runStreamingRequestOnce(
+     tFirst,
+     tLast,
+     model,
++    finishReason,
+     error,
+   };
+ 
+@@ -806,7 +824,6 @@ async function runStreamingRequestOnce(
+     out.httpStatus = httpStatus;
+     out.responseHeaders = responseHeaders;
+     out.completionId = completionId;
+-    out.finishReason = finishReason;
+     out.usage = usage;
+     out.sseEventCount = sseEventCount;
+     out.firstSseDataPreview = firstSseDataPreview;
+diff --git a/server/collectors/SystemCollector.js b/server/collectors/SystemCollector.js
+index 510e38353785b7c23eff7b82940fcbf36691729f..6b9571bb879b1b86c5fe61f88a6543b2bf234689 100644
+--- a/server/collectors/SystemCollector.js
++++ b/server/collectors/SystemCollector.js
+@@ -8,6 +8,7 @@ import { getSettings } from "../settings.js";
+ import { RoceSampler } from "./roce.js";
+ import { KernelJournal } from "./kernelJournal.js";
+ import { IntelSudoGate, IntelVramCache, buildIntelProbeScript, parseIntelProbe, sampleIntelCards } from "./intelGpu.js";
++import { nativeTensorFoldCapacityCommand, parseNativeTensorFoldCapacity } from "./tensorfoldCapacity.js";
+ import {
+   WINDOWS_GPU_SCRIPT,
+   WINDOWS_SYSTEM_SCRIPT,
+@@ -639,6 +640,32 @@ export class SystemCollector {
+     return (await this.probeResidentModels(execute)) ?? [];
+   }
+ 
++  /**
++   * Fresh native dsv41 capacity from the actual Linux listener. No privilege
++   * changes or launcher-file inference: unreadable/unsupported is unknown.
++   * A pinned HTTP host might be a different machine than this unit's SSH host.
++   */
++  async probeNativeTensorFoldCapacity(port) {
++    const spark = this.spark;
++    const identity = () => JSON.stringify([this.spark?.id, this.spark?.isLocal, this.spark?.platform,
++      this.spark?.lanIp, this.spark?.llmHost, this.spark?.ssh?.host, this.spark?.ssh?.user, this.spark?.ssh?.port]);
++    const target = identity();
++    if (spark.platform === "windows" || spark.platform === "darwin" ||
++        String(spark.llmHost || "").trim()) return null;
++    const host = spark.isLocal ? "127.0.0.1" : String(spark.lanIp || "").trim();
++    const command = nativeTensorFoldCapacityCommand(port, host);
++    if (!command) return null;
++    try {
++      const raw = spark.isLocal
++        ? await this._execOnHostNet(command, { allowContainerFallback: false, maxBuffer: 8192 })
++        : await sshExec(spark, command, { timeoutMs: 8000 });
++      if (this.spark !== spark || identity() !== target) return null;
++      return parseNativeTensorFoldCapacity(raw);
++    } catch {
++      return null;
++    }
++  }
++
+   /** Collect GPU metrics (temperature, usage, power, VRAM). */
+   async collectGpu() {
+     try {
+diff --git a/server/collectors/__tests__/AdmissionBench.test.js b/server/collectors/__tests__/AdmissionBench.test.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..5ab2104cb1082924d5440a0d40bd3aca58d9c691
+--- /dev/null
++++ b/server/collectors/__tests__/AdmissionBench.test.js
+@@ -0,0 +1,85 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import { readFileSync } from 'node:fs';
++import { runInNewContext } from 'node:vm';
++import { runCachedTailScenario, validateCachedTail, validateAdmissionCapacity } from '../CachedTailBench.js';
++import { validateDecodeBudget, validateDecodePoolBudget } from '../../validate.js';
++
++test('admission has bounded work and per-request capacity while allowing a queued fourth request', () => {
++  assert.equal(validateCachedTail('admission'), 'admission');
++  assert.throws(() => validateCachedTail('admission', true));
++  assert.throws(() => validateCachedTail('admission', false, true));
++  assert.doesNotThrow(() => validateAdmissionCapacity(524288, 262144));
++  for (const [pool,ctx] of [[null,262144],[524287,262144],[524288,null],[524288,163839],[Infinity,262144]]) {
++    assert.throws(() => validateAdmissionCapacity(pool, ctx));
++  }
++  assert.doesNotThrow(() => validateDecodeBudget([5],32768));
++  assert.doesNotThrow(() => validateDecodePoolBudget([1],126000,32768,524288));
++  assert.throws(() => validateDecodePoolBudget([4],126000,32768,524288));
++  const route=readFileSync(new URL('../../index.js',import.meta.url),'utf8');
++  const expression=route.match(/const concurrencies = (cachedTail \? [^;]+);/)?.[1];
++  assert.deepEqual(Array.from(runInNewContext(expression,{cachedTail:'admission'})),[4]);
++});
++
++test('admission uses natural completion, reports native cache and completion time, and rejects invalid samples', {timeout:15000}, async t => {
++  let running=0, completed=0, calls=0, fixture='valid';
++  const bodies=[];
++  const server=http.createServer(async(req,res)=>{
++    if(req.url==='/metrics') {
++      const observed=fixture==='busy'?1:fixture==='outside-prime'&&running>0?running+1:running;
++      if(fixture==='busy')fixture='valid'; // Busy at entry; idle at cleanup.
++      return res.end(`tensorfold:requests_running ${observed}\ntensorfold:requests_waiting 0\ntensorfold:request_latency_seconds_count ${completed}\ntensorfold:client_disconnections_total 0\n`);
++    }
++    let raw='';for await(const chunk of req)raw+=chunk;
++    const body=JSON.parse(raw);bodies.push(body);calls++;
++    // Concurrent HTTP requests may arrive in a different order. Native token
++    // counts belong to the request's continuation, not its arrival position.
++    const position=body.max_tokens===8?0:Number(body.messages[0].content.match(/\nContinuation ([1-4])\./)[1]);
++    running++;res.setHeader('content-type','text/event-stream');
++    res.write('data: '+JSON.stringify({choices:[{delta:{reasoning_content:'Checking.'}}]})+'\n\n');
++    setTimeout(()=>{
++      const cached=position===0?0:fixture==='cache-loss'?100001:114560;
++      const usage={prompt_tokens:position===0?114688:114688+[1024,2048,4096,8192][position-1],completion_tokens:20};
++      if(fixture==='wrong-geometry'&&position>0)usage.prompt_tokens=115712;
++      if(fixture!=='missing-cache'||position===0)usage.prompt_tokens_details={cached_tokens:cached};
++      running--;completed++;
++      res.end('data: '+JSON.stringify({choices:[{delta:{content:'1. Verify the backup.'},finish_reason:fixture==='truncated'&&position>0?'length':'stop'}],usage})+'\n\ndata: [DONE]\n\n');
++      if(fixture==='outside'&&position===4)completed++;
++    },fixture==='outside-prime'?400:30);
++  });
++  await new Promise(r=>server.listen(0,'127.0.0.1',r));
++  t.after(()=>{server.closeAllConnections();server.close();});
++  const options={baseUrl:`http://127.0.0.1:${server.address().port}`,modelId:'fixture',mode:'admission',salt:'admission-offline'};
++  const result=await runCachedTailScenario(options);
++  assert.equal(result.error,null);assert.equal(result.concurrency,4);assert.equal(result.streams.length,5);
++  assert.equal(result.samples.length,1);assert.equal(result.samples[0].comparisonValid,true);
++  assert.equal(result.samples[0].traffic.submitted,5);assert.equal(result.samples[0].completedRequests,4);
++  assert.ok(result.samples[0].waveDurationMs>0);assert.ok(result.samples[0].requestsPerMinute>0);
++  assert.equal(bodies[0].max_tokens,8);
++  for(const body of bodies.slice(1)){
++    assert.equal(body.max_tokens,32768);assert.equal(body.reasoning_effort,'high');
++    assert.equal(body.temperature,0.7);assert.equal(body.top_k,20);
++    for(const key of ['min_tokens','ignore_eos','stop'])assert.equal(key in body,false);
++  }
++  for(const row of result.streams.slice(1)){
++    assert.equal(row.maxOutputTokens,32768);assert.equal(row.cachedTokens,114560);
++    assert.equal(row.uncachedPromptTokens,row.reportedPromptTokens-114560);
++    assert.equal(row.finishReason,'stop');assert.ok(row.ttftContentMs>=0);
++    assert.equal('contentPreview' in row,false);assert.equal('prompt' in row,false);
++  }
++  for(const invalid of ['missing-cache','truncated','outside','wrong-geometry','cache-loss']){
++    fixture=invalid;
++    const r=await runCachedTailScenario(options);
++    assert.ok(r.error,invalid);assert.equal(r.samples[0].comparisonValid,false,invalid);
++    assert.equal(r.samples[0].discarded,true,invalid);
++  }
++  const beforeOutside=calls;fixture='outside-prime';
++  const contaminated=await runCachedTailScenario(options);
++  assert.match(contaminated.error,/Sample discarded: outside traffic/);
++  assert.equal(calls-beforeOutside,1,'must not submit the measured wave after contamination');
++  assert.equal(contaminated.samples[0].comparisonValid,false);
++  const before=calls;fixture='busy';
++  const busy=await runCachedTailScenario({...options,abortSignal:AbortSignal.timeout(100)});
++  assert.match(busy.error,/not idle/);assert.equal(calls,before);
++});
+diff --git a/server/collectors/__tests__/LlmProbe.pool-context.test.js b/server/collectors/__tests__/LlmProbe.pool-context.test.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..c1f5e47e750794a152fa92f8fc3678feb2821240
+--- /dev/null
++++ b/server/collectors/__tests__/LlmProbe.pool-context.test.js
+@@ -0,0 +1,38 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { LlmProbe } from '../LlmProbe.js';
++import { parseNativeTensorFoldCapacity } from '../tensorfoldCapacity.js';
++const health = { status:'ok', warming:false, pool_tokens:655360, pool_free_tokens:123456 };
++const receipt = (extra={}) => ({capacityTokens:524288,poolTokens:655360,pid:123,startIdentity:'456',configSha256:'a'.repeat(64),source:'tensorfold-native-dsv41-process',observedAt:Date.now(),...extra});
++function probe(h=health,r=receipt()) {
++ const p=new LlmProbe({lanIp:'127.0.0.1'},8888,{readNativeSharedPool:async()=>r});
++ p.backendType='tensorfold';p.authOpen=true;
++ p._fetch=async()=>({ok:true,json:async()=>h});return p;
++}
++test('explicit physical pool retains a separate verified logical context',async()=>{
++ const p=probe();p._applyTensorFoldPool(health);await p._refreshNativeSharedPool(health);
++ assert.equal(p.kvCacheTokens,655360);assert.equal(p.kvCacheTokensAvailable,123456);assert.equal(p._nativeContextTokens,524288);
++ const c=await p.getSharedPoolCapacity();assert.equal(c.capacityTokens,655360);assert.equal(c.contextTokens,524288);assert.equal(c.availableTokens,123456);
++});
++test('optional native pool survives two parsing layers; malformed values fail',()=>{
++ const r=receipt();assert.deepEqual(parseNativeTensorFoldCapacity(parseNativeTensorFoldCapacity(r)),r);
++ for(const value of [null,0,-1,1.1,'655360',true])assert.equal(parseNativeTensorFoldCapacity(receipt({poolTokens:value})),null);
++});
++test('missing or mismatched native pool cannot establish logical context',async()=>{
++ for(const r of [null,receipt({poolTokens:524288}),(()=>{const x=receipt();delete x.poolTokens;return x;})()]){
++  const p=probe(health,r);p._applyTensorFoldPool(health);await p._refreshNativeSharedPool(health);
++  assert.equal(p._nativeContextTokens,null);assert.equal(p.kvCacheTokens,655360);
++  const c=await p.getSharedPoolCapacity();assert.equal(c.contextTokens,null);assert.equal(c.capacityTokens,655360);
++ }
++});
++test('invalid explicit pool never falls back to logical capacity',async()=>{
++ for(const value of [0,-1,null,'bad']){const p=probe({...health,pool_tokens:value});assert.equal(await p.getSharedPoolCapacity(),null);}
++});
++test('legacy native context remains capacity only when both reads omit pool',async()=>{
++ const h={status:'ok',warming:false};const r=receipt();delete r.poolTokens;
++ assert.equal((await probe(h,r).getSharedPoolCapacity()).capacityTokens,524288);
++ assert.equal(await probe(h,receipt()).getSharedPoolCapacity(),null);
++});
++test('remote model has explicit pool but no host-derived context',async()=>{
++ const p=probe();p.spark.llmHost='192.0.2.1';assert.equal((await p.getSharedPoolCapacity()).contextTokens,null);
++});
+diff --git a/server/collectors/contextFill.js b/server/collectors/contextFill.js
+index ad328c842414392f7e383dfe34f954a81ea26e15..391ec186cc8a14710c40871a182ce46b2b7f4a81 100644
+--- a/server/collectors/contextFill.js
++++ b/server/collectors/contextFill.js
+@@ -70,26 +70,19 @@ export function buildContextPrompt(targetTokens, salt, task) {
+ 
+ /** A cached share at or above this counts a deep-context stream as served from the prefix cache. */
+ export const CONTEXT_CACHED_SHARE = 0.9;
+-/** With no cached-token count reported, a first token under this share of the prefill pass's means a cache hit. */
+-export const CONTEXT_TTFT_CACHED_SHARE = 0.25;
+ 
+ /**
+  * Did a measured deep-context stream start from the prefilled KV, or re-prefill the context?
+- * Uses the server's cached-token count when it reports one, otherwise compares first-token
+- * latency against the prefill pass.
++ * Uses reported cached tokens. Latency alone cannot verify reuse; missing counters remain unknown.
+  * @param {{ promptTokens: number, cachedTokens: number, ttftMs: number, fillTtftMs: number }} s
+  * @returns {"cached" | "partial" | "uncached" | "unknown"}
+  */
+ export function assessContextCache({ promptTokens, cachedTokens, ttftMs, fillTtftMs }) {
+   const prompt = Number(promptTokens) || 0;
+-  const cached = Number(cachedTokens) || 0;
+-  if (prompt > 0 && cached > 0) {
++  const cached = cachedTokens == null ? NaN : Number(cachedTokens);
++  if (prompt > 0 && Number.isFinite(cached) && cached >= 0) {
++    if (cached === 0) return "uncached";
+     return cached / prompt >= CONTEXT_CACHED_SHARE ? "cached" : "partial";
+   }
+-  const ttft = Number(ttftMs) || 0;
+-  const fill = Number(fillTtftMs) || 0;
+-  if (ttft > 0 && fill > 0) {
+-    return ttft <= fill * CONTEXT_TTFT_CACHED_SHARE ? "cached" : "uncached";
+-  }
+   return "unknown";
+ }
+diff --git a/server/collectors/streamPause.js b/server/collectors/streamPause.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb4c5fd66257329d6ba2b4bbee1aff931ed20215
+--- /dev/null
++++ b/server/collectors/streamPause.js
+@@ -0,0 +1,34 @@
++// Shared by ordinary decode waves and cached-tail scenarios. Measures received
++// SSE event gaps, not individual GPU token latency (one event can hold drafts).
++export function streamPauseMeter() {
++  let first = null, last = null, longest = null, start = null, end = null, count = 0;
++  return {
++    note(d) {
++      if (d?.tLast == null || d?.tFirst == null) return;
++      if (first !== d.tFirst) {
++        first = d.tFirst; last = longest = start = end = null; count = 0;
++      }
++      if (last != null) {
++        const gap = d.tLast - last;
++        if (longest == null || gap > longest) { longest = gap; start = last; end = d.tLast; }
++        count++;
++      }
++      last = d.tLast;
++    },
++    result(offset = 0) {
++      const round = (n) => n == null ? null : Math.round(n * 100) / 100;
++      return {
++        maxStreamEventGapMs: round(longest),
++        maxStreamEventGapStartMonotonicMs: round(start == null ? null : offset + start),
++        maxStreamEventGapEndMonotonicMs: round(end == null ? null : offset + end),
++        streamEventGapCount: count,
++      };
++    },
++  };
++}
++
++// Nearest-rank P95 of each decoder's longest observed SSE gap.
++export function p95LongestPause(streams) {
++  const values = streams.map(s => s.maxStreamEventGapMs).filter(Number.isFinite).sort((a,b) => a-b);
++  return values.length ? values[Math.ceil(values.length * .95) - 1] : null;
++}
+diff --git a/server/collectors/tensorfoldCapacity.js b/server/collectors/tensorfoldCapacity.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..2a5b0f56b167340f0ddcf92710a4055e3d2267d9
+--- /dev/null
++++ b/server/collectors/tensorfoldCapacity.js
+@@ -0,0 +1,183 @@
++import net from "node:net";
++
++/** The lookup is a bounded observation, never a retained launcher configuration. */
++export const NATIVE_CAPACITY_MAX_AGE_MS = 10_000;
++export const NATIVE_CAPACITY_SOURCE = "tensorfold-native-dsv41-process";
++
++/**
++ * Older Linux native dsv41 uses --context for shared capacity. Newer builds
++ * report an independent physical pool in health; --context remains logical.
++ * This is backend-specific:
++ * neither a tokenizer limit nor another TensorFold family's context is a pool.
++ * Only the process owning the requested listening socket can establish it.
++ * The optional proc root is used by isolated fixtures, never by runtime callers.
++ */
++export const NATIVE_TENSORFOLD_CAPACITY_PYTHON = String.raw`import hashlib, ipaddress, json, os, pathlib, sys, time, urllib.request
++ROOT = pathlib.Path(sys.argv[3]) if len(sys.argv) > 3 else pathlib.Path('/proc')
++PORT, HOST = int(sys.argv[1]), ipaddress.ip_address(sys.argv[2])
++END = time.monotonic() + 2
++def check():
++    if time.monotonic() > END:
++        raise ValueError('lookup deadline')
++def read(p, limit):
++    check()
++    with p.open('rb') as f:
++        b = f.read(limit + 1)
++    if len(b) > limit:
++        raise ValueError('bounded read')
++    return b
++def listeners():
++    out = set()
++    for name in ('tcp', 'tcp6'):
++        try:
++            rows = read(ROOT / 'net' / name, 524288).decode().splitlines()[1:]
++        except FileNotFoundError:
++            continue
++        for line in rows:
++            cols = line.split()
++            if len(cols) < 10 or cols[3] != '0A':
++                continue
++            address, port = cols[1].split(':')
++            if int(port, 16) != PORT:
++                continue
++            raw = bytes.fromhex(address)
++            raw = b''.join(raw[i:i+4][::-1] for i in range(0, len(raw), 4))
++            ip = ipaddress.ip_address(raw)
++            if ip.version == HOST.version and (ip.is_unspecified or ip == HOST):
++                out.add(cols[9])
++    if len(out) != 1:
++        raise ValueError('ambiguous listener')
++    return out
++def start(p):
++    raw = read(p / 'stat', 8192).decode()
++    return raw[raw.rfind(')') + 2:].split()[19]
++def option(argv, name):
++    values = []
++    for i, value in enumerate(argv):
++        if value == name:
++            if i + 1 == len(argv):
++                raise ValueError('missing option')
++            values.append(argv[i + 1])
++        elif value.startswith(name + '='):
++            values.append(value[len(name)+1:])
++    if len(values) != 1:
++        raise ValueError('missing or repeated option')
++    return values[0]
++def socket_inodes(p):
++    result = set()
++    count = 0
++    for f in (p / 'fd').iterdir():
++        check()
++        count += 1
++        if count > 4096:
++            raise ValueError('fd bound')
++        try:
++            link = os.readlink(f)
++        except FileNotFoundError:
++            continue
++        if link.startswith('socket:[') and link.endswith(']'):
++            result.add(link[8:-1])
++    return result
++def owner(bound):
++    matches = []
++    count = 0
++    for p in ROOT.iterdir():
++        check()
++        if not p.name.isdigit():
++            continue
++        count += 1
++        if count > 8192:
++            raise ValueError('pid bound')
++        try:
++            if socket_inodes(p) & bound:
++                matches.append(p)
++        except (FileNotFoundError, PermissionError, ProcessLookupError):
++            continue
++    if len(matches) != 1:
++        raise ValueError('ambiguous process')
++    return matches[0]
++class NoRedirect(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, *args, **kwargs):
++        return None
++try:
++    bound = listeners()
++    p = owner(bound)
++    initial = start(p)
++    cmd = read(p / 'cmdline', 65536)
++    argv = cmd.rstrip(bytes([0])).decode().split(chr(0))
++    if len(argv) < 3 or pathlib.PurePosixPath(argv[0]).name != 'tensorfold-native' or argv[1] != 'serve':
++        raise ValueError('unsupported command')
++    exe = os.readlink(p / 'exe')
++    exe_stat = (p / 'exe').stat()
++    if pathlib.PurePosixPath(exe).name != 'tensorfold-native':
++        raise ValueError('unexpected executable')
++    if option(argv, '--backend') != 'cuda' or int(option(argv, '--port')) != PORT:
++        raise ValueError('unsupported native server')
++    window = option(argv, '--context')
++    if not window.isdecimal() or not 0 < int(window) <= 9007199254740991:
++        raise ValueError('invalid context')
++    model = pathlib.PurePosixPath(argv[2])
++    if not model.is_absolute() or '..' in model.parts:
++        raise ValueError('invalid model root')
++    config_path = p / 'root' / str(model).lstrip('/') / 'config.json'
++    config_raw = read(config_path, 262144)
++    config = json.loads(config_raw)
++    if config.get('model_type') != 'deepseek_v41' or config.get('architectures') != ['DeepseekV41ForCausalLM']:
++        raise ValueError('unsupported family')
++    address = '[' + str(HOST) + ']' if HOST.version == 6 else str(HOST)
++    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
++    with opener.open('http://' + address + ':' + str(PORT) + '/health', timeout=1) as response:
++        raw = response.read(65537)
++        if len(raw) > 65536:
++            raise ValueError('health bound')
++        health = json.loads(raw)
++    if health.get('status') != 'ok' or health.get('warming') is not False:
++        raise ValueError('not ready')
++    if start(p) != initial or read(p / 'cmdline', 65536) != cmd or read(config_path, 262144) != config_raw:
++        raise ValueError('process changed')
++    current_exe = (p / 'exe').stat()
++    if os.readlink(p / 'exe') != exe or (current_exe.st_dev, current_exe.st_ino) != (exe_stat.st_dev, exe_stat.st_ino):
++        raise ValueError('executable changed')
++    if listeners() != bound or owner(bound) != p:
++        raise ValueError('listener changed')
++    check()
++    pool = health.get('pool_tokens')
++    extra = {}
++    if 'pool_tokens' in health:
++        if type(pool) is not int or not 0 < pool <= 9007199254740991:
++            raise ValueError('invalid physical pool')
++        extra['poolTokens'] = pool
++    print(json.dumps({**extra, 'capacityTokens': int(window), 'pid': int(p.name), 'startIdentity': initial,
++                      'configSha256': hashlib.sha256(config_raw).hexdigest(),
++                      'source': 'tensorfold-native-dsv41-process', 'observedAt': int(time.time() * 1000)}))
++except Exception:
++    print('null')
++`;
++
++const shellQuote = (s) => `'${String(s).replace(/'/g, `'"'"'`)}'`;
++
++export function nativeTensorFoldCapacityCommand(port, host) {
++  if (!Number.isInteger(port) || port < 1 || port > 65535 || !net.isIP(host)) return null;
++  return `python3 -c ${shellQuote(NATIVE_TENSORFOLD_CAPACITY_PYTHON)} ${port} ${shellQuote(host)}`;
++}
++
++/** Validate an observation before it can become a capacity figure. */
++export function parseNativeTensorFoldCapacity(raw, now = Date.now()) {
++  try {
++    const data = typeof raw === "string" ? JSON.parse(raw) : raw;
++    if (!data || data.source !== NATIVE_CAPACITY_SOURCE ||
++        !Number.isSafeInteger(data.capacityTokens) || data.capacityTokens <= 0 ||
++        !Number.isSafeInteger(data.pid) || data.pid <= 0 ||
++        typeof data.startIdentity !== "string" || !/^\d+$/.test(data.startIdentity) ||
++        typeof data.configSha256 !== "string" || !/^[a-f0-9]{64}$/.test(data.configSha256) ||
++        !Number.isSafeInteger(data.observedAt) || data.observedAt > now + 2000 ||
++        now - data.observedAt > NATIVE_CAPACITY_MAX_AGE_MS ||
++        (Object.hasOwn(data, "poolTokens") &&
++          (!Number.isSafeInteger(data.poolTokens) || data.poolTokens <= 0))) return null;
++    return { ...(Object.hasOwn(data, "poolTokens") ? { poolTokens: data.poolTokens } : {}),
++      capacityTokens: data.capacityTokens, pid: data.pid, startIdentity: data.startIdentity,
++      configSha256: data.configSha256, source: data.source, observedAt: data.observedAt };
++  } catch {
++    return null;
++  }
++}
+diff --git a/server/index.js b/server/index.js
+index 375f883ecf9b49da456016330f4511b63da832e3..448a44a4f24927e46e01c12c41304d5bc1d6c7ab 100644
+--- a/server/index.js
++++ b/server/index.js
+@@ -1,3 +1,4 @@
++import { validateCachedTail, validateAdmissionCapacity } from './collectors/CachedTailBench.js';
+ // First on purpose: imports are evaluated in order, and config.js, settings.js
+ // and the bench modules read process.env while they load.
+ import "dotenv/config";
+@@ -21,6 +22,7 @@ import {
+   assertAllowedTarget,
+   validateDecodeBudget,
+   validateDecodeContextBudget,
++  validateDecodePoolBudget,
+   validatePrefillBudget,
+ } from "./validate.js";
+ import { authStatus, authorizeUpgrade, createAuthMiddleware, createHostGuardMiddleware, isLoopbackBind, setTailscaleName } from "./auth.js";
+@@ -43,7 +45,12 @@ import {
+   backendForPort,
+   decodeBenchManager,
+   DECODE_BENCH_DEFAULTS,
++  MIXED_CACHE_CONTEXT,
++  HOT_SHORT_CACHE_CONTEXT,
++  HOT_SHORT_CACHE_REQUESTS,
+   normalizeConcurrencies,
++  validateMixedCacheArrival,
++  validateHotShortCache,
+ } from "./collectors/DecodeBench.js";
+ import {
+   prefillBenchManager,
+@@ -1561,15 +1568,25 @@ app.post("/api/sparks/:id/llm/bench", async (req, res) => {
+     ? spark.llmPorts
+     : [resolveLlmPort(spark)];
+ 
++  const mixedCache = req.body?.mixedCache === true;
++  let hotShortCache;
++  let cachedTail;
+   let target;
++  let mixedCacheArrival;
+   try {
++    hotShortCache = validateHotShortCache(req.body?.hotShortCache, mixedCache);
++    cachedTail = validateCachedTail(req.body?.cachedTail, mixedCache, hotShortCache);
++    mixedCacheArrival = validateMixedCacheArrival(req.body?.mixedCacheArrival, mixedCache);
+     target = await benchHttpTarget(spark, ports, req.body || {});
+   } catch (err) {
+     return res.status(err.status || 400).json({ error: err.message });
+   }
+   const port = target.port;
++  const concurrencies = cachedTail ? [cachedTail === "admission" ? 4 : cachedTail === "pause" || cachedTail === "pause-candidate" ? 8 : 1] : hotShortCache ? [1] : mixedCache ? [3] : normalizeConcurrencies(req.body?.concurrencies);
++  const admissionScenario = cachedTail === "admission";
++  const effectiveMaxTokens = admissionScenario ? 32768 : req.body?.maxTokens ?? 400;
+   try {
+-    validateDecodeBudget(normalizeConcurrencies(req.body?.concurrencies), req.body?.maxTokens ?? 400);
++    validateDecodeBudget(admissionScenario ? [5] : hotShortCache ? [HOT_SHORT_CACHE_REQUESTS] : concurrencies, effectiveMaxTokens);
+   } catch (err) {
+     return res.status(err.status || 429).json({ error: err.message });
+   }
+@@ -1578,6 +1595,7 @@ app.post("/api/sparks/:id/llm/bench", async (req, res) => {
+   let modelId = req.body?.modelId || null;
+   let backend = null;
+   let contextLength = null;
++  let sharedPoolTokens = null;
+   if (!target.custom && monitor) {
+     const snap = monitor.snapshot();
+     const llmList = Array.isArray(snap?.metrics?.llm) ? snap.metrics.llm : [];
+@@ -1591,17 +1609,39 @@ app.post("/api/sparks/:id/llm/bench", async (req, res) => {
+     // engine: resolved from this port's own snapshot entry (see backendForPort).
+     backend = backendForPort(llmList, port);
+     contextLength = Number(llm?.contextLength) > 0 ? Number(llm.contextLength) : null;
++    sharedPoolTokens = Number(llm?.kvCacheTokens) > 0 ? Number(llm.kvCacheTokens) : null;
+   }
+ 
+   // Deep-context start: every stream carries `contextTokens` of prompt before it decodes.
+-  const contextTokens = parseContextSize(req.body?.contextTokens) || 0;
++  if ((mixedCache || hotShortCache || cachedTail) && (target.custom || !monitor || backend !== "tensorfold")) {
++    return res.status(400).json({ error: hotShortCache ? "Hot-short cache retention requires a monitored local TensorFold model" : "Mixed cache requires a monitored local TensorFold model" });
++  }
++  const contextTokens = admissionScenario ? 126000 : cachedTail ? 24576 : hotShortCache ? HOT_SHORT_CACHE_CONTEXT : mixedCache ? MIXED_CACHE_CONTEXT : parseContextSize(req.body?.contextTokens) || 0;
++  if (contextTokens > 0 && !target.custom && monitor && backend === "tensorfold") {
++    // Admission needs a fresh observation of this port, not a retained display snapshot.
++    const pool = await monitor.llmProbes?.get(port)?.getSharedPoolCapacity?.();
++    sharedPoolTokens = Number.isSafeInteger(pool?.capacityTokens) && pool.capacityTokens > 0
++      ? pool.capacityTokens : null;
++    if (Number.isSafeInteger(pool?.contextTokens) && pool.contextTokens > 0) contextLength = pool.contextTokens;
++  }
+   if (contextTokens > 0) {
+     try {
+-      validateDecodeContextBudget(normalizeConcurrencies(req.body?.concurrencies), contextTokens);
++      if ((hotShortCache || cachedTail) && !sharedPoolTokens) {
++        const err = new Error("Hot-short cache retention requires fresh shared KV capacity");
++        err.status = 400;
++        throw err;
++      }
++      if (cachedTail && (sharedPoolTokens < 262144 || contextLength < 147456)) throw new Error("Cached-tail scenario requires at least 262144 shared KV tokens and 147456 context");
++      validateDecodeContextBudget(admissionScenario ? [5] : hotShortCache ? [HOT_SHORT_CACHE_REQUESTS] : concurrencies, contextTokens);
++      if (admissionScenario) validateAdmissionCapacity(sharedPoolTokens, contextLength);
++      // Admission measures four queued requests, not four simultaneously resident
++      // streams. Still enforce full per-request fit and the fixed work budget.
++      validateDecodePoolBudget(admissionScenario ? [1] : concurrencies, contextTokens,
++        effectiveMaxTokens, sharedPoolTokens);
+     } catch (err) {
+       return res.status(err.status || 429).json({ error: err.message });
+     }
+-    const maxTokens = Number(req.body?.maxTokens ?? 400);
++    const maxTokens = Number(effectiveMaxTokens);
+     if (!sizeFitsContext(contextTokens, contextLength, PREFILL_RESERVE_TOKENS + maxTokens, 1)) {
+       return res.status(400).json({
+         error: `${formatContextSize(contextTokens)} of context plus ${maxTokens} reply tokens does not fit the model context (${contextLength.toLocaleString()} tokens)`,
+@@ -1618,12 +1658,16 @@ app.post("/api/sparks/:id/llm/bench", async (req, res) => {
+       port,
+       modelId,
+       backend,
+-      concurrencies: req.body?.concurrencies,
++      concurrencies,
++      mixedCache,
++      mixedCacheArrival,
++      hotShortCache,
++      cachedTail,
+       maxTokens: req.body?.maxTokens,
+       promptType: req.body?.promptType,
+       temperature: req.body?.temperature,
+       thinking: req.body?.thinking,
+-      contextTokens: req.body?.contextTokens,
++      contextTokens: hotShortCache ? HOT_SHORT_CACHE_CONTEXT : mixedCache ? MIXED_CACHE_CONTEXT : req.body?.contextTokens,
+       debug: benchDebug,
+       apiKey: target.apiKey,
+       host: target.host,
+diff --git a/server/sparks/SparkMonitor.js b/server/sparks/SparkMonitor.js
+index 119c913af60ddb10b1661227f83d109f3577f3fa..7fc0dad8e941c72cc26b10f3fb36e911dad4aca5 100644
+--- a/server/sparks/SparkMonitor.js
++++ b/server/sparks/SparkMonitor.js
+@@ -158,7 +158,10 @@ export class SparkMonitor {
+     this.llmProbes = new Map();
+     if (this._llmMonitoringEnabled(spark)) {
+       for (const port of this._llmPorts()) {
+-        this.llmProbes.set(port, new LlmProbe(spark, port, this._llmProbeOptions ? this._llmProbeOptions() : undefined));
++        this.llmProbes.set(port, new LlmProbe(spark, port, {
++          ...(this._llmProbeOptions ? this._llmProbeOptions() : {}),
++          readNativeSharedPool: (targetPort) => this.collector.probeNativeTensorFoldCapacity(targetPort),
++        }));
+       }
+     }
+ 
+@@ -310,7 +313,10 @@ export class SparkMonitor {
+         existing.spark = spark;
+         this.llmProbes.set(port, existing);
+       } else {
+-        this.llmProbes.set(port, new LlmProbe(spark, port, this._llmProbeOptions ? this._llmProbeOptions() : undefined));
++        this.llmProbes.set(port, new LlmProbe(spark, port, {
++          ...(this._llmProbeOptions ? this._llmProbeOptions() : {}),
++          readNativeSharedPool: (targetPort) => this.collector.probeNativeTensorFoldCapacity(targetPort),
++        }));
+       }
+     }
+     for (const [port, probe] of prevProbes) {
+diff --git a/server/validate.js b/server/validate.js
+index bae88cd07a4d43df4b7a3a0b28206c97da430e52..5589f98763906404d546a566777e8f51fdd3a6d3 100644
+--- a/server/validate.js
++++ b/server/validate.js
+@@ -343,6 +343,21 @@ export function validateDecodeBudget(concurrencies, maxTokens, limit = DECODE_BE
+ 
+ export const DECODE_CONTEXT_WORK_LIMIT = 4_000_000;
+ 
++/** A deep-context wave needs all its streams' contexts and replies resident together. */
++export function validateDecodePoolBudget(concurrencies, contextTokens, maxTokens, poolTokens) {
++  const concurrency = Math.max(1, ...concurrencies);
++  const pool = Number(poolTokens);
++  const fail = (message) => { const err = new Error(message); err.status = 400; throw err; };
++  if (!Number.isFinite(pool) || pool <= 0) {
++    if (concurrency > 1) fail("Shared KV capacity is unreported; use one stream for deep-context decode");
++    return;
++  }
++  const perStream = Math.ceil((Number(contextTokens) + Number(maxTokens) + 128) / 2048) * 2048;
++  if (concurrency * perStream > pool) {
++    fail(`Deep-context wave needs ${concurrency * perStream} shared KV tokens; capacity is ${pool}`);
++  }
++}
++
+ /** Deep-context decode prefills every stream of every level, so cap the total prompt tokens. */
+ export function validateDecodeContextBudget(concurrencies, contextTokens, limit = DECODE_CONTEXT_WORK_LIMIT) {
+   const work = (Array.isArray(concurrencies) ? concurrencies : []).reduce(
+diff --git a/src/api/llmTokenTypes.ts b/src/api/llmTokenTypes.ts
+index c003ce20153d7dd9426716824f6fafc7436006e5..a1f77f0a354cf6ca8621ab1f6d085d60b26f71ba 100644
+--- a/src/api/llmTokenTypes.ts
++++ b/src/api/llmTokenTypes.ts
+@@ -3,17 +3,25 @@
+  * Kept outside src/api/types.ts so upstream merges never touch it.
+  */
+ 
++/** Forward measured subset; first/last bound observations and do not imply continuous coverage. */
++export interface CacheMeasurement {
++  promptTokens: number;
++  cachedTokens: number;
++  firstAt: number;
++  lastAt: number;
++}
++
+ /** Cumulative token totals for one model on one series (spark + LLM port). */
+ export interface LlmTokenModelTotals {
+   modelId: string;
+   promptTokens: number;
+   completionTokens: number;
+-  /** Prefix-cache served subset of promptTokens (0 when the backend does not report the split). */
++  /** Recorded cached prompt tokens; an incomplete total when cacheReported is false. */
+   cachedTokens: number;
+   /**
+-   * Whether the backend reports the cache split at all. `false` = `cachedTokens` is not
+-   * a measured value (the engine publishes no prefix-cache counter), so it must render as
+-   * "unknown" instead of a 0 % hit rate. Absent on older data (treated as reported).
++   * Whether ALL input in the row has a measured cache split. `false` keeps the
++   * full-row split unknown even when cacheMeasurement describes a measured part.
++   * Absent on older data (treated as reported).
+    */
+   cacheReported?: boolean;
+   /**
+@@ -21,6 +29,8 @@ export interface LlmTokenModelTotals {
+    * cached nor computed. Absent on older data (then `cacheReported: false` means all of it).
+    */
+   unreportedPromptTokens?: number;
++  /** Optional measured forward subset, without relabeling unknown historical input. */
++  cacheMeasurement?: CacheMeasurement;
+   lastSeenAt: number;
+ }
+ 
+diff --git a/src/api/types.ts b/src/api/types.ts
+index a2cda843e05f2b770d5b8ac1f5ba0abf42791da3..64aaac8738c599ad17792f58950b3dc0f97accd2 100644
+--- a/src/api/types.ts
++++ b/src/api/types.ts
+@@ -1,3 +1,5 @@
++import type { CacheMeasurement } from "./llmTokenTypes";
++
+ // ─── Spark config (matches server/sparks.json) ────────────
+ export interface SparkConfig {
+   id: string;
+@@ -574,6 +576,8 @@ export interface LlmMetrics {
+   totalOutputTokens: number;
+   /** Cumulative cached (prefix-cache served) prompt tokens. null when the backend does not expose the split. */
+   totalCachedTokens: number | null;
++  /** Cache-covered logical prompt subtotal; omitted for legacy full-scope counters, null when unavailable. */
++  totalCacheMeasuredPromptTokens?: number | null;
+   /** Cumulative total prompt (prefill) tokens as reported by the LLM server. null when the backend does not expose it. */
+   totalPromptTokens: number | null;
+   /**
+@@ -1556,12 +1560,21 @@ export interface DecodeBenchConfig {
+   thinking?: boolean;
+   /** Prompt tokens each stream carries before it decodes (deep-context start). Absent: empty context. */
+   contextTokens?: number;
++  mixedCache?: boolean;
++  /** Ten sequential requests exercising hot-short/deep-prefix retention. */
++  hotShortCache?: boolean;
++  cachedTail?: "replay" | "replay-candidate" | "pause" | "pause-candidate" | "branch" | "branch-resume" | "admission";
++  reasoningEffort?: "high";
+   /** On-demand remote host (Tailscale HTTPS, etc.). */
+   host?: string;
+   tls?: boolean;
+ }
+ 
+ export interface DecodeBenchStreamResult {
++  maxOutputTokens?: number;
++  uncachedPromptTokens?: number | null;
++  finishReason?: string | null;
++  maxStreamEventGapMs?: number | null;
+   index: number;
+   ttftMs: number;
+   /** First answer token (post-reasoning) in ms from request start; null when the reply never leaves the reasoning phase. */
+@@ -1575,6 +1588,15 @@ export interface DecodeBenchStreamResult {
+   prefillTokens: number;
+   /** Prompt tokens the server served from its prefix cache. */
+   cachedTokens?: number;
++  probeRole?: string;
++  probeArrivalMs?: number | null;
++  /** Head-server wall-clock milliseconds bounding a sequential cache-probe request. */
++  probeStartedAt?: number;
++  probeFinishedAt?: number;
++  /** Native reported prompt count; null when only a client estimate exists. */
++  reportedPromptTokens?: number | null;
++  targetPromptTokens?: number;
++  recallPassed?: boolean | null;
+   /** Deep-context runs: did this stream decode from the prefilled KV? */
+   contextCache?: "cached" | "partial" | "uncached" | "unknown";
+   totalMs: number;
+@@ -1639,6 +1661,13 @@ export interface DecodeBenchLevelResult {
+   /** Deep-context runs: prompt tokens per stream and the time spent prefilling them before the wave. */
+   contextTokens?: number;
+   contextPrefillMs?: number;
++  mixedCache?: boolean;
++  samples?: { targetExtensionTokens?: number; actualExtensionTokens?: number; branchCachedTokens?: number; branchNativeTtftSeconds?: number; sample: number; reproduced?: boolean; comparisonValid?: boolean; overlapVerified?: boolean; p95LongestPauseMs?: number | null; waveDurationMs?: number; completedRequests?: number; requestsPerMinute?: number | null; meanCompletionMs?: number; meanFirstAnswerMs?: number | null; discarded?: boolean }[];
++  hotShortCache?: boolean;
++  cachedTail?: "replay" | "replay-candidate" | "pause" | "pause-candidate" | "branch" | "branch-resume" | "admission";
++  hotShortRetention?: "matched" | "different" | "unknown";
++  sharedTargetTokens?: number;
++  expectedRequests?: number;
+   contextCache?: { cached: number; partial: number; uncached: number; unknown: number };
+   streams: DecodeBenchStreamResult[];
+   model: string | null;
+@@ -1712,6 +1741,9 @@ export interface StartDecodeBenchRequest {
+   temperature?: number;
+   /** Default true. */
+   thinking?: boolean;
++  mixedCache?: boolean;
++  hotShortCache?: boolean;
++  cachedTail?: "replay" | "replay-candidate" | "pause" | "pause-candidate" | "branch" | "branch-resume" | "admission";
+   /** Prefill every stream with this many prompt tokens before the decode wave. 0 or omitted: start empty. */
+   contextTokens?: number;
+   /** On-demand remote LLM host (hostname or URL). Skips this Spark's LAN/SSH path. */
+@@ -2404,8 +2436,8 @@ export interface TokenHistoryRow {
+   /** Prompt tokens served from the prefix cache (always <= promptTokens). */
+   cachedTokens: number;
+   /**
+-   * Whether the backend measured the cache split for this bucket. `false` means the
+-   * engine publishes no prefix-cache counter, so `cachedTokens` is not a miss count.
++   * Whether the backend measured the entire input split for this bucket. `false`
++   * keeps the full split unknown even if a forward subset is measured.
+    * Absent on data recorded before the flag existed (treated as reported).
+    */
+   cacheReported?: boolean;
+@@ -2414,6 +2446,7 @@ export interface TokenHistoryRow {
+    * cached nor computed. Absent on older data (then `cacheReported: false` means all of it).
+    */
+   unreportedPromptTokens?: number;
++  cacheMeasurement?: CacheMeasurement;
+ }
+ 
+ export interface TokenHistory {
+diff --git a/src/components/SparkPage/BenchmarkDialog.tsx b/src/components/SparkPage/BenchmarkDialog.tsx
+index afdd0c0d99abec8b454ea84f41b8604700031122..8f4b37c45b0c94ce750ff63b8d9080ee7cc8106e 100644
+--- a/src/components/SparkPage/BenchmarkDialog.tsx
++++ b/src/components/SparkPage/BenchmarkDialog.tsx
+@@ -134,6 +134,20 @@ function formatTtft(ms: number): string {
+  */
+ function buildShareText(job: DecodeBenchJob, modelId: string | null): string {
+   const name = modelId || "unknown model";
++  if (job.config.cachedTail === "admission") return [
++    `${name} | Admission measurement · ${job.status} · four requests · 32K output allowance · natural completion · High · temperature 0.7`,
++    ...job.results.flatMap(r => [r.warning ?? "", ...r.streams.map(s => `${s.probeRole}: first answer ${s.ttftContentMs ?? "unknown"} ms; complete ${s.totalMs} ms; prompt ${s.reportedPromptTokens ?? "unknown"}; uncached ${s.uncachedPromptTokens ?? "unknown"}; output ${s.completionTokens}; finish ${s.finishReason ?? "unknown"}`), ...r.samples?.map(s => JSON.stringify(s)) ?? [], r.error ?? ""]),
++  ].join("\n");
++  if (job.config.cachedTail) return [
++    `Cached-tail ${job.config.cachedTail} · ${job.status} · unchanged engine · temperature 0 · server-default High`,
++    ...job.results.flatMap(r => [r.warning ?? "", ...r.streams.map(s => `${s.probeRole}: TTFT ${s.ttftMs} ms; cached ${s.cachedTokens ?? "unknown"}; longest SSE gap ${s.maxStreamEventGapMs ?? "unknown"} ms`), ...r.samples?.map(s => JSON.stringify(s)) ?? [], r.error ?? ""]),
++  ].join("\n");
++  if (job.config.hotShortCache) return [
++    `${name} | Hot-short cache retention (sequential):`,
++    ...job.results.flatMap((result) => result.streams.map((stream) =>
++      `${stream.probeRole}: input ${stream.reportedPromptTokens ?? "unknown"}, cached ${stream.cachedTokens ?? "unknown"}, recall ${stream.recallPassed == null ? "unknown" : stream.recallPassed ? "correct" : "incorrect"}`)),
++    ...job.results.map((result) => result.warning || result.error || "Native pressure evidence required."),
++  ].join("\n");
+   const typeLabel = decodeBenchTypeLabel(job.config?.promptType);
+   const ctx = job.config?.contextTokens ? `, starting at ${formatContextSize(job.config.contextTokens)} context` : "";
+   const head = `${name} | decode tok/s results (${typeLabel}, ${decodeBenchSamplingLabel(job.config)}${ctx}):`;
+@@ -144,7 +158,7 @@ function buildShareText(job: DecodeBenchJob, modelId: string | null): string {
+     .map((r) => {
+       if (r.totalDecodeTokens > 0 || r.totalCompletionTokens > 0) {
+         const agg = r.aggregateDecodeTps > 0 ? r.aggregateDecodeTps : r.meanDecodeTps;
+-        return `×${r.concurrency}  ${agg.toFixed(1)} agg  ${r.meanDecodeTps.toFixed(1)}/str  · TTFT ${formatTtft(r.meanTtftMs)}`;
++        return `×${r.concurrency}  ${agg.toFixed(1)} agg  ${r.meanDecodeTps.toFixed(1)}/str  · TTFT ${formatTtft(r.meanTtftMs)}${r.warning ? ` · WARNING: ${r.warning}` : ""}`;
+       }
+       return `×${r.concurrency}  failed${r.error ? ` — ${r.error}` : ""}`;
+     });
+@@ -158,6 +172,51 @@ function resultAgg(r: DecodeBenchJob["results"][number]): number {
+ 
+ function ResultRow({ r, max }: { r: DecodeBenchJob["results"][number]; max: number }) {
+   const { t } = useTranslation("benchmarks");
++  if (r.cachedTail === "admission") return <article className="bench-result-row">
++    <strong>Admission measurement · four requests · 32K output allowance · natural completion</strong>
++    {r.samples?.map(s => <p key={s.sample}>Valid: {String(s.comparisonValid === true && !s.discarded)} · completed {s.completedRequests ?? 0}/4 · wave {formatTtft(s.waveDurationMs ?? 0)} · {s.requestsPerMinute?.toFixed(2) ?? "unknown"} requests/min</p>)}
++    {r.streams.map((s,i) => <p key={i} className="bench-sheet__hint">{s.probeRole} · first answer {s.ttftContentMs == null ? "unknown" : formatTtft(s.ttftContentMs)} · complete {formatTtft(s.totalMs)} · input {s.reportedPromptTokens ?? "unknown"} · uncached {s.uncachedPromptTokens ?? "unknown"} · cached {s.cachedTokens ?? "unknown"} · output {s.completionTokens} · finish {s.finishReason ?? "unknown"} {s.error}</p>)}
++    <p>{r.error || r.warning}</p>
++  </article>;
++  if (r.cachedTail) return <article className="bench-result-row">
++    <strong>Cached-tail {r.cachedTail} · {r.cachedTail.endsWith("-candidate") ? "candidate measurement" : "original-engine measurement"}</strong>
++    {r.samples?.map(s => <p key={s.sample}>Sample {s.sample}: {s.comparisonValid != null ? `comparison valid: ${s.comparisonValid}${s.overlapVerified != null ? `; overlap: ${s.overlapVerified}; P95 longest SSE pause: ${s.p95LongestPauseMs ?? "unknown"} ms` : ""}` : s.targetExtensionTokens != null ? `extension ${s.actualExtensionTokens} tokens; cached ${s.branchCachedTokens}; first token ${s.branchNativeTtftSeconds}s` : s.reproduced != null ? `reproduced: ${s.reproduced}` : `overlap: ${s.overlapVerified}; P95 longest SSE pause: ${s.p95LongestPauseMs ?? "unknown"} ms`}</p>)}
++    {r.streams.map((s,i) => <p key={i} className="bench-sheet__hint">{s.probeRole} · TTFT {formatTtft(s.ttftMs)} · cached {s.cachedTokens ?? "unknown"} · longest pause {s.maxStreamEventGapMs ?? "unknown"} ms {s.error}</p>)}
++    <p>{r.error || r.warning}</p>
++  </article>;
++  if (r.hotShortCache) {
++    return (
++      <article className="bench-result-row">
++        <strong>Hot-short cache retention · {r.streams.length}/{r.expectedRequests ?? 10} sequential requests</strong>
++        {r.streams.map((stream) => (
++          <p key={stream.index} className="bench-sheet__hint">
++            {stream.index + 1}. {stream.probeRole} · input {stream.reportedPromptTokens ?? "unknown"} ·
++            cached {stream.cachedTokens ?? "unknown"} · TTFT {formatTtft(stream.ttftMs)} ·
++            recall {stream.recallPassed == null ? "unknown" : stream.recallPassed ? "correct" : "incorrect"}
++            {stream.error ? ` · ${stream.error}` : ""}
++          </p>
++        ))}
++        <p className="bench-sheet__hint">Deep replay: {r.hotShortRetention ?? "unknown"}. Verify native token geometry and budget pressure separately.</p>
++        {(r.warning || r.error) && <p className="bench-sheet__hint text-warning">{r.warning || r.error}</p>}
++      </article>
++    );
++  }
++  if (r.mixedCache) {
++    return (
++      <article className="bench-result-row">
++        <strong>Mixed cache admission</strong>
++        {r.streams.map((stream) => (
++          <p key={stream.index} className="bench-sheet__hint">
++            {stream.probeRole} · arrival {stream.probeArrivalMs == null ? "—" : formatTtft(stream.probeArrivalMs)} ·
++            TTFT {formatTtft(stream.ttftMs)} · {stream.contextCache} ·
++            {stream.cachedTokens ?? "?"}/{stream.prefillTokens} cached ·
++            {stream.error || ` completed in ${formatTtft(stream.totalMs)}`}
++          </p>
++        ))}
++        {(r.warning || r.error) && <p className="bench-sheet__hint text-warning">{r.warning || r.error}</p>}
++      </article>
++    );
++  }
+   const pct = max > 0 ? Math.max(2, Math.round((resultAgg(r) / max) * 100)) : 0;
+   return (
+     <article className="bench-result-row" title={r.error || undefined}>
+@@ -242,6 +301,12 @@ export function BenchmarkDialog({
+   const [temperatureDraft, setTemperatureDraft] = useState(String(DEFAULT_TEMPERATURE));
+   const [thinking, setThinking] = useState(DEFAULT_THINKING);
+   const [contextDraft, setContextDraft] = useState("");
++  const [cachedTailRequested, setCachedTail] = useState<"" | "replay" | "replay-candidate" | "pause" | "pause-candidate" | "branch" | "branch-resume" | "admission">("");
++  const cachedTail = remoteTarget ? "" : cachedTailRequested;
++  const [mixedCacheRequested, setMixedCache] = useState(false);
++  const mixedCache = mixedCacheRequested && !remoteTarget;
++  const [hotShortCacheRequested, setHotShortCache] = useState(false);
++  const hotShortCache = hotShortCacheRequested && !remoteTarget;
+   const [job, setJob] = useState<DecodeBenchJob | null>(null);
+   const [error, setError] = useState<string | null>(null);
+   const [starting, setStarting] = useState(false);
+@@ -308,7 +373,10 @@ export function BenchmarkDialog({
+     if (j.config?.maxTokens != null) {
+       setMaxTokensDraft(String(j.config.maxTokens));
+     }
+-    setContextDraft(j.config?.contextTokens ? String(j.config.contextTokens) : "");
++    setContextDraft(!j.config?.mixedCache && !j.config?.hotShortCache && j.config?.contextTokens ? String(j.config.contextTokens) : "");
++    setMixedCache(j.config?.mixedCache === true);
++    setHotShortCache(j.config?.hotShortCache === true);
++    setCachedTail(j.config?.cachedTail ?? "");
+     // Last-run type is shown on results; the picker always defaults to Structured
+     // for the next Run. Only a still-running job pins the picker.
+     if (j.status === "running" && j.config?.promptType) {
+@@ -465,21 +533,21 @@ export function BenchmarkDialog({
+       setError(t("decode.errorModel"));
+       return;
+     }
+-    if (selected.length === 0) {
++    if (!mixedCache && !hotShortCache && !cachedTail && selected.length === 0) {
+       setError(t("decode.errorConcurrency"));
+       return;
+     }
+-    const maxTokens = parseInt(maxTokensDraft.trim(), 10);
+-    if (!Number.isInteger(maxTokens) || maxTokens < 64 || maxTokens > 2048) {
++    const maxTokens = cachedTail === "admission" ? 32768 : cachedTail ? 2048 : hotShortCache ? 400 : parseInt(maxTokensDraft.trim(), 10);
++    if (cachedTail !== "admission" && (!Number.isInteger(maxTokens) || maxTokens < 64 || maxTokens > 2048)) {
+       setError(t("decode.errorMaxTokens"));
+       return;
+     }
+-    const temperature = Number(temperatureDraft.trim());
+-    if (temperatureDraft.trim() === "" || !Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
++    const temperature = cachedTail === "admission" ? 0.7 : cachedTail ? 0 : hotShortCache ? 0.7 : Number(temperatureDraft.trim());
++    if ((cachedTail !== "admission" && temperatureDraft.trim() === "") || !Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
+       setError(t("decode.errorTemperature"));
+       return;
+     }
+-    const contextTokens = parseContextDraft(contextDraft);
++    const contextTokens = mixedCache || hotShortCache || cachedTail ? 0 : parseContextDraft(contextDraft);
+     if (contextTokens == null) {
+       setError(
+         `Start context must be ${PREFILL_MIN_CONTEXT_SIZE} to ${PREFILL_MAX_CONTEXT_SIZE.toLocaleString()} tokens (e.g. 131072 or 128k), or empty`
+@@ -493,12 +561,15 @@ export function BenchmarkDialog({
+     try {
+       const started = await startDecodeBench(sparkId, {
+         port: benchPort,
+-        concurrencies: selected,
++        ...(cachedTail ? { cachedTail } : {}),
++        concurrencies: cachedTail ? [cachedTail === "admission" ? 4 : cachedTail === "pause" || cachedTail === "pause-candidate" ? 8 : 1] : hotShortCache ? [1] : mixedCache ? [3] : selected,
++        ...(mixedCache ? { mixedCache: true } : {}),
++        ...(hotShortCache ? { hotShortCache: true } : {}),
+         maxTokens,
+         modelId: selectedModel || undefined,
+         promptType,
+         temperature,
+-        thinking,
++        thinking: hotShortCache ? true : thinking,
+         ...(contextTokens > 0 ? { contextTokens } : {}),
+         ...(remoteTarget
+           ? { host: remoteTarget.host, tls: remoteTarget.tls }
+@@ -642,10 +713,10 @@ export function BenchmarkDialog({
+                       key={String(on)}
+                       type="button"
+                       role="radio"
+-                      aria-checked={thinking === on}
+-                      disabled={isRunning || starting}
++                      aria-checked={(cachedTail === "admission" ? true : thinking) === on}
++                      disabled={isRunning || starting || hotShortCache || cachedTail === "admission"}
+                       onClick={() => setThinking(on)}
+-                      className={`bench-conc-btn${thinking === on ? " is-on" : ""}`}
++                      className={`bench-conc-btn${(cachedTail === "admission" ? true : thinking) === on ? " is-on" : ""}`}
+                     >
+                       {on ? t("decode.withThinking") : t("decode.withoutThinking")}
+                     </button>
+@@ -668,8 +739,8 @@ export function BenchmarkDialog({
+                   inputMode="decimal"
+                   className="bench-input"
+                   size={6}
+-                  disabled={isRunning || starting}
+-                  value={temperatureDraft}
++                  disabled={isRunning || starting || hotShortCache || cachedTail === "admission"}
++                  value={cachedTail === "admission" ? "0.7" : temperatureDraft}
+                   onChange={(e) => {
+                     const raw = e.target.value;
+                     if (raw === "" || /^\d*\.?\d{0,2}$/.test(raw)) setTemperatureDraft(raw);
+@@ -691,7 +762,7 @@ export function BenchmarkDialog({
+                       <button
+                         key={n}
+                         type="button"
+-                        disabled={isRunning || starting}
++                        disabled={isRunning || starting || mixedCache || hotShortCache}
+                         onClick={() => toggleConcurrency(n)}
+                         className={`bench-conc-btn${on ? " is-on" : ""}`}
+                       >
+@@ -707,8 +778,55 @@ export function BenchmarkDialog({
+                   <label htmlFor="bench-start-context" className="bench-sheet__section-title">
+                     {t("decode.startContext")}
+                   </label>
++                  {!remoteTarget && (
++                    <label className="bench-sheet__hint">
++                      <input
++                        type="checkbox"
++                        checked={mixedCache}
++                        disabled={isRunning || starting}
++                        onChange={(event) => {
++                          setMixedCache(event.target.checked);
++                          if (event.target.checked) { setHotShortCache(false); setCachedTail(""); }
++                        }}
++                      />
++                      {" "}Mixed cache: cold 128k, warm 64k follow-up and short cold control
++                    </label>
++                  )}
++                  {!remoteTarget && (
++                    <label className="bench-sheet__hint">
++                      <input type="checkbox" checked={hotShortCache} disabled={isRunning || starting}
++                        onChange={(event) => {
++                          setHotShortCache(event.target.checked);
++                          if (event.target.checked) {
++                            setMixedCache(false);
++                            setCachedTail("");
++                            setMaxTokensDraft("400");
++                            setTemperatureDraft("0.7");
++                            setThinking(true);
++                          }
++                        }} />
++                      {" "}Hot-short cache retention: ten sequential requests
++                    </label>
++                  )}
++                  {!remoteTarget && <label className="bench-sheet__hint">Cached-tail measurement
++                    <select aria-label="Cached-tail measurement" value={cachedTail} disabled={isRunning || starting}
++                      onChange={e => { setCachedTail(e.target.value as "" | "replay" | "replay-candidate" | "pause" | "pause-candidate" | "branch" | "branch-resume" | "admission"); setMixedCache(false); setHotShortCache(false); }}>
++                      <option value="">Off</option><option value="replay">Original replay · three samples</option>
++                      <option value="replay-candidate">Candidate replay · three samples, compare timings separately</option>
++                      <option value="pause">Original pause · three samples, eight requests</option>
++                      <option value="pause-candidate">Candidate pause · three samples, eight requests</option>
++                      <option value="branch">Original branch retention · six cells + one bisection</option>
++                      <option value="branch-resume">Resume unfinished branch cells</option>
++                      <option value="admission">Admission · four requests, 32K allowance, natural completion</option>
++                    </select>
++                    <span>{cachedTail === "admission" ? " One fresh approximately 115K prefix, then four concurrent requests with 1K/2K/4K/8K target tails and a 32K output allowance. Natural completion, High, temperature 0.7. Measures first answer and completion time. Starts idle; outside traffic discards the sample. Server lane settings stay unchanged." : cachedTail === "pause-candidate" ? " Run a successful candidate replay on this model/port within the last hour first. Six decoders + cold fill + cached short tail; compare SSE pauses with baseline separately. Does not test a third arrival behind a medium tail." : cachedTail === "replay-candidate" ? " Candidate replay validates cache and overlap without the original timing band. Compare timings with a separate baseline; a valid sample is not an acceptance verdict." : " Run replay first. Pause uses six decoders + cold fill + cached short tail. Fixed replay sampling; engine unchanged."}</span>
++                  </label>}
+                   <p className="bench-sheet__hint">
+-                    {t("decode.contextHint")}
++                    {hotShortCache
++                      ? "Five cold 159k branches, A at 76k and 159k, exact A refresh, new C, then exact A replay. Shared 16k system prefix; thinking High, temperature 0.7, top-k 20 and 400 output tokens. No extra priming requests. Actual token sizes and native budget pressure must be verified."
++                      : mixedCache
++                      ? "Runs three staggered requests after warming one prefix. The regular context and concurrency selections are ignored."
++                      : "Each stream is prefilled to this many tokens first, then decodes from there. Needs prefix caching and KV room for concurrency × context."}
+                   </p>
+                 </div>
+                   <div className="bench-conc-grid" role="group" aria-label={t("decode.startContextAria")}>
+@@ -718,7 +836,7 @@ export function BenchmarkDialog({
+                       <button
+                         key={n}
+                         type="button"
+-                        disabled={isRunning || starting}
++                        disabled={isRunning || starting || mixedCache || hotShortCache}
+                         onClick={() => setContextDraft(n === 0 ? "" : String(n))}
+                         className={`bench-conc-btn${on ? " is-on" : ""}`}
+                       >
+@@ -733,7 +851,7 @@ export function BenchmarkDialog({
+                     type="text"
+                     inputMode="text"
+                     placeholder={t("dialog.customExample")}
+-                    disabled={isRunning || starting}
++                    disabled={isRunning || starting || mixedCache || hotShortCache}
+                     value={contextDraft}
+                     onChange={(e) => {
+                       const raw = e.target.value;
+@@ -759,8 +877,8 @@ export function BenchmarkDialog({
+                   type="text"
+                   inputMode="numeric"
+                   pattern="[0-9]*"
+-                  disabled={isRunning || starting}
+-                  value={maxTokensDraft}
++                  disabled={isRunning || starting || hotShortCache || cachedTail === "admission"}
++                  value={cachedTail === "admission" ? "32768" : maxTokensDraft}
+                   onChange={(e) => {
+                     const raw = e.target.value;
+                     if (raw === "" || /^\d+$/.test(raw)) setMaxTokensDraft(raw);
+@@ -788,7 +906,7 @@ export function BenchmarkDialog({
+                     {job.progress.currentConcurrency != null
+                       ? ` · ×${job.progress.currentConcurrency}`
+                       : ""}
+-                    {contextLabel(job.config?.contextTokens)}
++                    {job.config.cachedTail ? `Cached-tail ${job.config.cachedTail}` : job.config.hotShortCache ? "Hot-short cache retention" : job.config.mixedCache ? "Mixed cache admission" : contextLabel(job.config.contextTokens)}
+                   </span>
+                   <span className="bench-progress__meta">
+                     {job.progress.completedLevels}/{job.progress.totalLevels}
+@@ -832,7 +950,7 @@ export function BenchmarkDialog({
+                 <span className="bench-status-meta">
+                   {decodeBenchTypeLabel(job.config.promptType)} · {job.config.maxTokens} tok ·{" "}
+                   {decodeBenchSamplingLabel(job.config)}
+-                  {contextLabel(job.config.contextTokens)} ·{" "}
++                  {job.config.cachedTail ? `Cached-tail ${job.config.cachedTail}` : job.config.hotShortCache ? "Hot-short cache retention" : job.config.mixedCache ? "Mixed cache admission" : contextLabel(job.config.contextTokens)} ·{" "}
+                   {job.config.concurrencies.join(", ")} conc
+                   {job.durationMs != null ? ` · ${formatDuration(job.durationMs)}` : ""}
+                 </span>
+@@ -881,7 +999,7 @@ export function BenchmarkDialog({
+           })
+         }
+         kind="decode"
+-        shareImage={shareImage}
++        shareImage={shareImage && !job.config.hotShortCache && !job.config.cachedTail}
+         onError={setError}
+       />
+     ) : null;
+@@ -905,7 +1023,7 @@ export function BenchmarkDialog({
+               type="button"
+               className="btn btn--primary"
+               onClick={() => void handleStart()}
+-              disabled={starting || selected.length === 0}
++              disabled={starting || (!mixedCache && !hotShortCache && !cachedTail && selected.length === 0)}
+             >
+               {starting ? t("dialog.starting") : t("dialog.run")}
+             </button>
+@@ -1048,7 +1166,7 @@ export function BenchmarkDialog({
+                     })
+                   }
+                   kind="decode"
+-                  shareImage={shareImage}
++                  shareImage={shareImage && !job.config.hotShortCache && !job.config.cachedTail}
+                   onError={setError}
+                 />
+               )}
+@@ -1068,7 +1186,7 @@ export function BenchmarkDialog({
+                 type="button"
+                 className="bench-btn bench-btn--primary"
+                 onClick={() => void handleStart()}
+-                disabled={starting || selected.length === 0 || !modelSelectionValid}
++                disabled={starting || (!mixedCache && !hotShortCache && !cachedTail && selected.length === 0) || !modelSelectionValid}
+               >
+                 {starting ? t("dialog.starting") : t("dialog.run")}
+               </button>
+diff --git a/src/components/SparkPage/decodeSampling.ts b/src/components/SparkPage/decodeSampling.ts
+index 1797ff8f6102f75bb1a066defaf4f5655f63208c..6da364068279ab4a05fb58111c958469488c1a8c 100644
+--- a/src/components/SparkPage/decodeSampling.ts
++++ b/src/components/SparkPage/decodeSampling.ts
+@@ -1,7 +1,8 @@
+ import type { DecodeBenchConfig } from "../../api/types";
+ 
+ /** "temp 0.7 · thinking on". Runs saved before these options existed ran at temp 0 with thinking off. */
+-export function decodeBenchSamplingLabel(config: Pick<DecodeBenchConfig, "temperature" | "thinking" | "topK"> | null | undefined): string {
++export function decodeBenchSamplingLabel(config: Pick<DecodeBenchConfig, "temperature" | "thinking" | "topK" | "cachedTail"> | null | undefined): string {
++  if (config?.cachedTail) return "temp 0 · server-default High · 8-token probes";
+   const temp = typeof config?.temperature === "number" ? config.temperature : 0;
+   const thinking = typeof config?.thinking === "boolean" ? config.thinking : false;
+   const topK = config?.topK != null ? ` · top_k ${config.topK}` : "";
+@@ -9,6 +10,6 @@ export function decodeBenchSamplingLabel(config: Pick<DecodeBenchConfig, "temper
+ }
+ 
+ /** True when the runs used more than one temperature / thinking setting, so their tok/s are not comparable. */
+-export function decodeBenchSamplingMixed(configs: Array<Pick<DecodeBenchConfig, "temperature" | "thinking" | "topK"> | null | undefined>): boolean {
++export function decodeBenchSamplingMixed(configs: Array<Pick<DecodeBenchConfig, "temperature" | "thinking" | "topK" | "cachedTail"> | null | undefined>): boolean {
+   return new Set(configs.map(decodeBenchSamplingLabel)).size > 1;
+ }
+diff --git a/src/components/bench/sparkdash/historyRows.ts b/src/components/bench/sparkdash/historyRows.ts
+index 5a594f18f59eb088e99f2085200c986cfa8b6762..478513c2e01070dd080ab40b1082e2e40f686c87 100644
+--- a/src/components/bench/sparkdash/historyRows.ts
++++ b/src/components/bench/sparkdash/historyRows.ts
+@@ -38,7 +38,7 @@ function aggregate(r: DecodeBenchJob["results"][number]): number {
+ 
+ /** Peak aggregate decode tok/s over the levels that produced tokens. */
+ export function decodeHistoryRow(job: DecodeBenchJob, labels: BenchmarkHistoryLabels = DEFAULT_LABELS): HistoryRow {
+-  const ok = job.results.filter((r) => r.totalDecodeTokens > 0 || r.totalCompletionTokens > 0);
++  const ok = job.results.filter((r) => !r.warning && (r.totalDecodeTokens > 0 || r.totalCompletionTokens > 0));
+   const best = ok.reduce<DecodeBenchJob["results"][number] | null>(
+     (b, r) => (b == null || aggregate(r) > aggregate(b) ? r : b),
+     null
+@@ -56,6 +56,7 @@ export function decodeHistoryRow(job: DecodeBenchJob, labels: BenchmarkHistoryLa
+       single ? `${single.meanDecodeTps.toFixed(1)}${labels.streamAtOne}` : null,
+       decodeBenchSamplingLabel(job.config),
+       job.config.contextTokens ? `${formatContextSize(job.config.contextTokens)} ${labels.startContext}` : null,
++      job.results.some((r) => r.warning) ? "warning: context reuse unverified or incomplete" : null,
+     ]
+       .filter(Boolean)
+       .join(" · "),

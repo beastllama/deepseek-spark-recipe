@@ -1,0 +1,342 @@
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -134,6 +134,8 @@
+     lanes: u32 = 1,
+     /// Prompt plus reply tokens one request may use (0: no limit).
+     context_window: u32 = 0,
++    /// Shared physical positions across requests, when the backend has a fixed pool.
++    pool_tokens: u32 = 0,
+     context_fitted: bool = false,
+     /// What the engine enforces; the server refuses requests that need more.
+     call_gates: bool = false,
+--- a/zig/src/families/dsv41/dsv41.zig
++++ b/zig/src/families/dsv41/dsv41.zig
+@@ -48,6 +48,7 @@
+ pub const draft = @import("draft.zig");
+ pub const sampling = @import("sampling.zig");
+ pub const model = @import("model.zig");
++pub const pool_geometry = @import("pool_geometry.zig");
+ pub const lanes = @import("lanes.zig");
+ 
+ test {
+@@ -95,5 +96,6 @@
+     refAll(draft);
+     refAll(sampling);
+     refAll(model);
++    refAll(pool_geometry);
+     refAll(lanes);
+ }
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -618,7 +618,7 @@
+         const len = ids.len;
+         if (len == 0) return error.EmptyPrompt;
+         const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
+-        if (size > m.pool_cap) return error.PromptTooLong;
++        if (size > m.context_cap or size > m.pool_cap) return error.PromptTooLong;
+         if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
+         const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
+         var taken: [max_streams][2]usize = undefined;
+--- a/zig/src/families/dsv41/lanes_main.zig
++++ b/zig/src/families/dsv41/lanes_main.zig
+@@ -1,4 +1,4 @@
+-//! tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P]
++//! tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--context C]
+ //!   [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN]: the lane
+ //! gate of the Zig port. TensorFold 1.0's lane core (core/lanes: its round loop, depth rule, window planning, copies,
+ //! acceptance) serves the requests through the port's Backend (lanes.zig) on every rank: rank 0 runs the core and
+@@ -7,13 +7,13 @@
+ //! layer gate's, their kernels from --rdma-kernels or the embedded image). Each reply's token_sha (sha256 of its comma-joined ids,
+ //! the served server's) against the served reply's: the drafted, concurrent reply must be the served one. One JSON
+ //! line a request, then the summary. FILE: zrec_lanereq.py's requests (prompt ids, max_tokens, sampling, expect_sha).
+-//! KIT_DIR: a gate dir's aot/, cubins/, RoPE tables (as many rows as the pool) and engram.json.
++//! KIT_DIR: a gate dir's aot/, cubins/, RoPE tables (as many rows as the logical context) and engram.json.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const dsv41 = @import("dsv41");
+ const lanes = @import("lanes");
+ 
+-const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--fix-k K] [--round-rows R] [--streams S]\n";
++const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--context C] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--fix-k K] [--round-rows R] [--streams S]\n";
+ 
+ const Request = struct {
+     name: []const u8 = "",
+@@ -83,6 +83,8 @@
+             o.streams = try std.fmt.parseInt(usize, val, 10);
+         } else if (std.mem.eql(u8, key, "--pool")) {
+             o.pool = try std.fmt.parseInt(usize, val, 10);
++        } else if (std.mem.eql(u8, key, "--context")) {
++            o.context = try std.fmt.parseInt(usize, val, 10);
+         } else if (std.mem.eql(u8, key, "--drafts")) {
+             o.drafts = !std.mem.eql(u8, val, "0");
+         } else if (std.mem.eql(u8, key, "--arena-gib")) {
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -6,6 +6,7 @@
+ //! the windows' taps absorbed (verify), and the drafter's batched pass (pass). Every primitive is the gates' own code
+ //! path (prompt.zig, round.zig, draft.zig) with no checks.
+ const std = @import("std");
++const pool_geometry = @import("pool_geometry.zig");
+ const cuda = @import("cuda");
+ const Config = @import("config.zig").Config;
+ const rank_cache = @import("rank_cache.zig");
+@@ -49,6 +50,7 @@
+     engram_dir: ?[]const u8 = null, // the Engram tables (none: a checkpoint without Engram layers)
+     token_map: ?[]const u8 = null, // the compressed token map (the lane's JSON cache)
+     pool: usize = 1 << 18, // positions of the streams' shared plane (their extents together)
++    context: ?usize = null, // one logical sequence; null preserves the original pool-sized limit
+     drafts: bool = true, // load the DSpark drafter
+     rdma_devices: ?[]const u8 = null, // the decode gathers over RDMA on these devices (comma separated), else NCCL: TP2's
+     // ring (rdma.zig), or at world 4 the 2D split's decode-size exchanges over its rings (ring2d.zig)
+@@ -76,6 +78,7 @@
+     streams: usize, // the pool's streams (Options.streams)
+     round_ms: []const f64, // the lane core's round costs by rows (Options.round_ms, else draft.round_ms)
+     pool_cap: usize,
++    context_cap: usize,
+     cache_dir: std.Io.Dir,
+     cache_file: std.Io.File,
+     ix: rank_cache.Index,
+@@ -148,6 +151,7 @@
+     /// and sets up every buffer. Needs `ctx` current on this thread.
+     pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, o: Options) !*Model {
+         if (o.world != 2 and o.world != 4) return error.NotPortedYet; // TP2, or the four-node 2D split (prompt2d.zig)
++        const geometry = try pool_geometry.Geometry.init(o.context orelse o.pool, o.pool);
+         const m = try gpa.create(Model);
+         errdefer gpa.destroy(m);
+         m.* = undefined;
+@@ -169,7 +173,8 @@
+         m.streams = o.streams;
+         m.round_ms = o.round_ms orelse &draft.round_ms;
+         if (m.round_ms.len == 0) return error.BadRoundMs;
+-        m.pool_cap = o.pool;
++        m.pool_cap = geometry.pool;
++        m.context_cap = geometry.context;
+         m.fill_slot = 0;
+         m.prof = false;
+         m.timer = null;
+@@ -195,6 +200,7 @@
+         const d = ctx.d;
+         m.cfg = try Config.read(a, io, o.model_dir);
+         const c = &m.cfg;
++        if (m.context_cap > c.max_position) return error.BadPoolCapacity;
+         m.stream = try cuda.Stream.init(d, true);
+         errdefer m.stream.deinit();
+ 
+@@ -250,9 +256,9 @@
+         m.ex = try exact.Exact.load(d, cuda.kernels.dsv41_torch);
+         errdefer m.ex.unload();
+ 
+-        // the RoPE tables (the served build's bits: torch CPU pow and polar), every position of the pool
++        // RoPE uses logical positions; a larger shared plane must not change a sequence's tables.
+         const half = c.rope_dim / 2;
+-        const rope_rows = o.pool + round.max_rows + 1;
++        const rope_rows = m.context_cap + round.max_rows + 1;
+         m.rope_buf = try cuda.DeviceBuffer.alloc(d, 4 * rope_rows * half * 4);
+         errdefer m.rope_buf.free();
+         {
+@@ -290,7 +296,7 @@
+         }
+         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
+         m.eng.round_rows = o.round_rows;
+-        m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, o.pool);
++        m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, m.context_cap);
+         m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, m.streams);
+         m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
+         errdefer m.blas.close();
+@@ -301,7 +307,7 @@
+             r.* = try m.arena.take(m.streams * m.eng.ringBytes());
+             try d.check(d.api.cuMemsetD8Async(r.*, 0, m.streams * m.eng.ringBytes(), m.stream.handle), "cuMemsetD8Async");
+         }
+-        m.rd = try round.Round.init(&m.eng, &m.arena, a, o.pool);
++        m.rd = try round.Round.init(&m.eng, &m.arena, a, m.context_cap);
+         m.amax = try m.arena.take(round.max_rows * 4);
+         if (o.graphs) {
+             m.graphs = round.Graphs.init(gpa);
+@@ -781,7 +787,7 @@
+         const e = &m.eng;
+         if (m.prof) try m.stream.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
+         const t0 = m.now();
+-        try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.pool_cap, null, if (m.graphs) |*g| g else null);
++        try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.context_cap, null, if (m.graphs) |*g| g else null);
+         if (m.prof) {
+             m.t_enqueue = m.now() - t0;
+             try m.stream.synchronize();
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -19,7 +19,9 @@
+ //!   TF_DS_L2_PREFETCH=1                         the paced L2 prefetch of the next kernels' weights
+ //!   TF_DS_ENGRAM_AIO=1                          a round's Engram reads by Linux AIO on O_DIRECT
+ //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
+-//! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
++//! TF_DS_POOL_TOKENS optionally expands only shared cache storage (2048-aligned, at most 1048576).
++//! The worker must use matching --pool and --context values; the paired launcher verifies both.
++//! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). By default the pool holds --context
+ //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
+ //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the
+ //! other nodes; TF_RDMA_DEVICES (and TF_DS_RDMA_KERNELS: rdma_gather.cu's fatbin, unset: the embedded one) put its
+@@ -56,6 +58,7 @@
+     rows: u32,
+     /// Device bytes each admitted stream allocates for its own sequence.
+     stream_bytes: usize,
++    pool_tokens: u32,
+     ctx: *anyopaque,
+     deinit: *const fn (*anyopaque) void,
+     lone: ?LoneRun = null,
+@@ -120,6 +123,7 @@
+     const master = link.parseIp(getenv("TF_TP_MASTER") orelse return error.NoMaster) catch return error.BadMaster;
+     const port = std.fmt.parseInt(u16, getenv("TF_TP_PORT") orelse "29620", 10) catch return error.BadPort;
+     const arena_gib = if (getenv("TF_DS_ARENA_GIB")) |t| std.fmt.parseInt(usize, t, 10) catch return error.BadArena else 0;
++    const geometry = try @import("pool_geometry.zig").Geometry.fromText(o.context, getenv("TF_DS_POOL_TOKENS"));
+     const st = try gpa.create(State);
+     errdefer gpa.destroy(st);
+     st.gpa = gpa;
+@@ -140,7 +144,8 @@
+         .side = if (getenv("TF_DS_HC_SIDE")) |v| !std.mem.eql(u8, v, "0") else false,
+         .prefetch = if (getenv("TF_DS_L2_PREFETCH")) |v| !std.mem.eql(u8, v, "0") else false,
+         .engram_aio = if (getenv("TF_DS_ENGRAM_AIO")) |v| !std.mem.eql(u8, v, "0") else false,
+-        .pool = o.context,
++        .pool = geometry.pool,
++        .context = geometry.context,
+         .drafts = o.drafts,
+         .arena_bytes = arena_gib << 30,
+         .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
+@@ -159,7 +164,7 @@
+     const L = lanes_mod.Lanes;
+     // Drops reach the peer immediately, so keep() can evict just before saving an admitted stream.
+     const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .usable = L.snapUsableFn, .tail = @intCast(st.m.cfg.window), .reserve_before_pass = false, .branch_anchors = true };
+-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
++    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .pool_tokens = @intCast(st.m.pool_cap), .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
+ }
+ 
+ /// This rank's attempted eager graph fallbacks (/metrics; rank 1 logs its own); null without graphs.
+@@ -188,6 +193,7 @@
+         error.NoFreeSlot => "this engine serves TF_DS_STREAMS streams at once (default 4): --parallel at most that",
+         error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 64",
+         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 32",
++        error.BadPoolCapacity => "TF_DS_POOL_TOKENS must fit the supported pool, be 2048-aligned and at least --context; worker --pool/--context must match",
+         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
+         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
+         error.EngramRankFault => "an Engram row read failed on one rank; the broken pair exits75 for recovery",
+--- a/zig/src/families/dsv41/pool_geometry.zig
++++ b/zig/src/families/dsv41/pool_geometry.zig
+@@ -0,0 +1,43 @@
++//! Physical cache capacity is independent of one request's logical sequence limit.
++const std = @import("std");
++
++pub const Geometry = struct {
++    context: usize,
++    pool: usize,
++
++    pub fn init(context: usize, pool: usize) !Geometry {
++        if (context == 0 or pool < context or pool > (1 << 20)) return error.BadPoolCapacity;
++        return .{ .context = context, .pool = pool };
++    }
++
++    /// Absent override preserves the existing context-sized pool exactly.
++    pub fn fromText(context: usize, text: ?[]const u8) !Geometry {
++        const value = text orelse return init(context, context);
++        const pool = std.fmt.parseInt(usize, value, 10) catch return error.BadPoolCapacity;
++        if (pool % 2048 != 0) return error.BadPoolCapacity;
++        return init(context, pool);
++    }
++};
++
++test "separate pool keeps logical context and every output reservation" {
++    const g = try Geometry.fromText(524288, "655360");
++    try std.testing.expectEqual(@as(usize, 524288), g.context);
++    try std.testing.expectEqual(@as(usize, 655360), g.pool);
++    var reserved: usize = 0;
++    for ([_]usize{ 115825, 116849, 118897, 122993 }) |prompt| {
++        reserved += std.mem.alignForward(usize, prompt + 32768 + 64 + 2, 2048);
++    }
++    try std.testing.expectEqual(@as(usize, 612352), reserved);
++    try std.testing.expect(reserved > g.context and reserved <= g.pool);
++}
++
++test "default geometry is unchanged and invalid overrides fail closed" {
++    for ([_]usize{ 16385, 262144, 524288, 1048576 }) |context| {
++        const g = try Geometry.fromText(context, null);
++        try std.testing.expectEqual(context, g.context);
++        try std.testing.expectEqual(context, g.pool);
++    }
++    for ([_][]const u8{ "", "0", "262144", "655361", "1048577", "-1", "no", "9999999999999999999999999" }) |bad|
++        try std.testing.expectError(error.BadPoolCapacity, Geometry.fromText(524288, bad));
++    try std.testing.expectError(error.BadPoolCapacity, Geometry.init(0, 655360));
++}
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -407,7 +407,7 @@
+     };
+     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
+     const vision: ?api.Vision = if (@hasField(@TypeOf(loaded), "vision")) loaded.vision else null;
+-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .efforts = familyEfforts(F), .vision = vision, .call_gates = true }, .{ .ctx = loaded.ctx, .text = F.explain });
++    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .pool_tokens = if (@hasField(@TypeOf(loaded), "pool_tokens")) loaded.pool_tokens else 0, .startup = h.startup, .efforts = familyEfforts(F), .vision = vision, .call_gates = true }, .{ .ctx = loaded.ctx, .text = F.explain });
+     opened = true;
+     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+ }
+--- a/zig/src/server/status_routes.zig
++++ b/zig/src/server/status_routes.zig
+@@ -19,6 +19,7 @@
+     for (srv.config.model_ids, ids) |id, *slot| slot.* = .{ .string = id };
+     try o.put(a, "model_ids", .{ .array = ids });
+     try o.put(a, "max_batch_size", try json.intValue(a, srv.info.lanes));
++    if (srv.info.pool_tokens > 0) try o.put(a, "pool_tokens", try json.intValue(a, srv.info.pool_tokens));
+     var status: api.Status = .{};
+     srv.engine.status(&status, &.{});
+     try o.put(a, "warming", .{ .bool = status.warming });
+--- a/zig/src/server/stream_preflight_test.zig
++++ b/zig/src/server/stream_preflight_test.zig
+@@ -59,12 +59,14 @@
+ /// An 8-token window whose engine answers "hi" at once.
+ const HiEngine = struct {
+     submissions: usize = 0,
++    info_: api.Info = .{ .context_window = 8 },
+     fn engine(e: *@This()) api.Engine {
+         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
+     }
+ 
+-    fn info(_: *anyopaque) api.Info {
+-        return .{ .context_window = 8 };
++    fn info(ctx: *anyopaque) api.Info {
++        const e: *HiEngine = @ptrCast(@alignCast(ctx));
++        return e.info_;
+     }
+ 
+     fn submit(ctx: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
+@@ -152,8 +154,12 @@
+ }
+ 
+ fn sendTo(route: Route, body: []const u8, start: Seen) !Seen {
++    return sendToInfo(route, body, start, .{ .context_window = 8 });
++}
++
++fn sendToInfo(route: Route, body: []const u8, start: Seen, info: api.Info) !Seen {
+     var text: TestText = .{};
+-    var backend: HiEngine = .{};
++    var backend: HiEngine = .{ .info_ = info };
+     var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
+         .served_name = "test-model",
+         .model_ids = &.{"test-model"},
+@@ -215,6 +221,22 @@
+     try expectContextInStream(try send(.chat, "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":true,\"max_tokens\":100}"), true);
+ }
+ 
++test "a larger shared pool never expands one request's context or cuts its output allowance" {
++    const info: api.Info = .{ .lanes = 8, .context_window = 524288, .pool_tokens = 655360 };
++    for ([_]Route{ .chat, .messages, .responses }) |route| {
++        const too_large = switch (route) {
++            .chat, .messages => "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":true,\"max_tokens\":524288}",
++            .responses => "{\"model\":\"test-model\",\"input\":\"x\",\"stream\":true,\"max_output_tokens\":524288}",
++        };
++        const rejected = try sendToInfo(route, too_large, .{}, info);
++        try std.testing.expect(rejected.context_code);
++        try std.testing.expectEqual(@as(usize, 0), rejected.submissions);
++    }
++    const allowed = try sendToInfo(.chat, "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":true,\"max_tokens\":32768}", .{}, info);
++    try std.testing.expect(!allowed.context_code);
++    try std.testing.expectEqual(@as(usize, 1), allowed.submissions);
++}
++
+ test "a streamed chat with tools over the window reports the context error with no role chunk" {
+     try expectContextInStream(try send(.chat, "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":true,\"max_tokens\":100," ++
+         "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\"}}}]}"), false);

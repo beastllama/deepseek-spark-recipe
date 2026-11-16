@@ -1,0 +1,1505 @@
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -54,6 +54,8 @@
+     // filling job itself is left alone: its own cancel stays in `cancels` for its pass to see, admissions wait.
+     interleave_ns: i96 = 0,
+     filling: ?*Job = null, // synchronous legacy pass or a pass suspended between pieces
++    cached_fill_limit: u32 = 0, // opt-in: one cached tail per original fill, in ordinary bounded pieces (0: off)
++    parked_fill: ?*Job = null, // original fill while its cached-tail cut-in runs in pieces; no third admission
+     between_err: ?anyerror = null,
+     trace: ?*SpanTrace = null,
+ 
+@@ -133,6 +135,7 @@
+         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
+         kept0: u64 = 0, // the store's kept count when the job looked it up
+         wait_for_fill: bool = false, // its cached cut-in was refused; retry after the current fill
++        used_piece_cut_in: bool = false, // this original fill has already lent one service opportunity
+         // A refused placement waits for occupancy to fall or its deadline. Other queued work may still fit.
+         full_wait: ?usize = null,
+         full_retry: i96 = 0,
+@@ -142,7 +145,17 @@
+             const job: *Job = @ptrCast(@alignCast(ptr));
+             job.reported(); // before a keep can evict the entry the pass restored
+             if (!cacheable(job.request)) return;
+-            if (job.host.cache) |store| _ = store.keep(keyOf(job.request), at, s, job.request.chunks);
++            if (job.host.cache) |store| {
++                var protection = CacheProtection.init(job.host, job) catch {
++                    store.counts.failed += 1;
++                    return; // Cannot prove queue safety: skip this optional snapshot.
++                };
++                defer protection.entries.deinit(job.host.gpa);
++                const before = store.protected;
++                store.protected = protection.entries.items;
++                defer store.protected = before;
++                _ = store.keep(keyOf(job.request), at, s, job.request.chunks);
++            }
+         }
+ 
+         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
+@@ -166,6 +179,46 @@
+ 
+     fn keyOf(r: *const Request) []const u32 {
+         return if (r.cache_key.len == r.prompt.len) r.cache_key else r.prompt;
++    }
++
++    // Inspired by TensorFold PR2699, adapted to our keep-time eviction and fixed
++    // 1 GiB budget. The engine thread owns entries; the mutex protects only the
++    // request-list snapshot. No Job pointer survives the lock or the operation.
++    const CacheProtection = struct {
++        entries: std.ArrayList(*pc.Entry) = .empty,
++
++        fn init(h: *LaneHost, current: *Job) !CacheProtection {
++            var out: CacheProtection = .{};
++            errdefer out.entries.deinit(h.gpa);
++            h.lock();
++            defer h.unlock();
++            for (h.queued.items) |job| try out.protect(h, current, job);
++            for (h.admitted.items) |job| try out.protect(h, current, job);
++            return out;
++        }
++
++        fn protect(out: *CacheProtection, h: *LaneHost, current: *Job, job: *Job) !void {
++            if (job == current or !cacheable(job.request)) return;
++            // An admitted pass may still borrow this exact object even if a
++            // newer/deeper state now matches. Protect the actual borrow first.
++            const entry = job.entry orelse blk: {
++                if (job.started) return; // Already restored; no queued dependency.
++                break :blk h.cache.?.find(keyOf(job.request), job.request.chunks) orelse return;
++            };
++            if (std.mem.indexOfScalar(*pc.Entry, out.entries.items, entry) == null)
++                try out.entries.append(h.gpa, entry);
++        }
++    };
++
++    fn cacheLookup(h: *LaneHost, job: *Job) !pc.Lookup {
++        const store = h.cache.?;
++        var protection = try CacheProtection.init(h, job);
++        defer protection.entries.deinit(h.gpa);
++        const before = store.protected;
++        store.protected = protection.entries.items;
++        defer store.protected = before;
++        const r = job.request;
++        return store.lookup(h.gpa, keyOf(r), r.history_len, r.shared_prefixes, r.chunks);
+     }
+ 
+     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
+@@ -382,8 +435,10 @@
+         for (ids) |id| {
+             if (keep) |k| if (id == k) continue; // its pass ends it (error.Cancelled) and admitOne finishes it
+             for (h.admitted.items, 0..) |job, i| if (job.id == id) {
+-                if (h.filling == job) h.filling = null;
++                const was_filling = h.filling == job;
++                if (h.parked_fill == job) h.parked_fill = null;
+                 if (!job.stream.finished) h.core.discard(&job.stream);
++                if (was_filling) h.restoreParkedFill();
+                 h.lock();
+                 _ = h.admitted.orderedRemove(i);
+                 h.unlock();
+@@ -402,11 +457,28 @@
+         h.mutex.unlock(h.io);
+     }
+ 
++    fn canPieceCutIn(h: *const LaneHost, r: *const Request, cached: usize) bool {
++        const parent = h.filling orelse return false;
++        const tail = r.prompt.len -| cached;
++        return h.cached_fill_limit > h.core.cut_in and h.core.cut_in_reuse and
++            h.core.fill_chunks > 0 and h.core.backend.vtable.prefill_part != null and
++            h.core.cut_in > 0 and cached > 0 and tail > h.core.cut_in and tail <= h.cached_fill_limit and
++            r.images.len == 0 and parent.request.images.len == 0 and
++            h.parked_fill == null and !parent.used_piece_cut_in;
++    }
++
++    fn restoreParkedFill(h: *LaneHost) void {
++        h.filling = h.parked_fill;
++        h.parked_fill = null;
++        h.core.filling = if (h.filling) |job| &job.stream else null;
++        h.core.rounds_since = 0;
++    }
++
+     /// Prefills the next queued request (while a pass fills, the first that core.cutsIn).
+     /// False also ends the admission burst after a cached cut-in so the decode loop gets a turn.
+     fn admitOne(h: *LaneHost) bool {
+         h.lock();
+-        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) {
++        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes or h.parked_fill != null) {
+             h.unlock();
+             return false;
+         }
+@@ -428,7 +500,7 @@
+             if (!h.core.cut_in_reuse or !h.core.cutsIn(0, r.images.len > 0)) continue;
+             const store = h.cache orelse continue;
+             const entry = store.find(keyOf(r), r.chunks) orelse continue;
+-            if (h.core.cutsIn(r.prompt.len -| entry.at, false)) break i;
++            if (h.core.cutsIn(r.prompt.len -| entry.at, false) or h.canPieceCutIn(r, entry.at)) break i;
+         } else {
+             h.unlock();
+             return false;
+@@ -454,7 +526,7 @@
+         const r = job.request;
+         var reuse: lanes.stream.Reuse = .{};
+         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
+-        if (cacheable(r)) if (h.cache) |store| if (store.lookup(h.gpa, keyOf(r), r.history_len, r.shared_prefixes, r.chunks)) |l| {
++        if (cacheable(r)) if (h.cache) |store| if (h.cacheLookup(job)) |l| {
+             job.entry = l.entry;
+             job.kept0 = store.counts.kept;
+             job.marks = l.marks;
+@@ -496,10 +568,11 @@
+         job.began = began;
+         if (h.loneFits(job)) return h.runLone(job, began);
+         const sliced = h.core.fill_chunks > 0 and h.core.backend.vtable.prefill_part != null;
++        const piece_cut_in = reuse.saved != null and h.canPieceCutIn(r, reuse.at);
+         if (h.interleave_ns > 0 and r.images.len == 0) {
+             if (!sliced) {
+                 job.stream.between = .{ .ptr = h, .wanted = betweenWanted, .run = between };
+-            } else if (h.filling != null and h.core.cut_in_reuse and reuse.saved != null) {
++            } else if (!piece_cut_in and h.filling != null and h.core.cut_in_reuse and reuse.saved != null) {
+                 job.stream.between = .{ .ptr = job, .wanted = cachedBetweenWanted, .run = cachedBetween };
+             }
+         }
+@@ -510,9 +583,19 @@
+         const pace_warm_resume = sliced and h.filling == null and r.images.len == 0 and reuse.saved != null and
+             h.core.cut_in_reuse and h.core.fill_rounds > 0 and h.core.runnableCount() > 0;
+         const span_start = h.traceTime();
++        const parent = if (piece_cut_in) h.filling else null;
++        const fill_first = h.core.fill_first;
++        if (piece_cut_in) {
++            // Native fillOpen still verifies the actual restored prefix and refuses a cold fallback.
++            job.stream.cut_in_limit = h.cached_fill_limit;
++            h.core.filling = null;
++            h.core.fill_first = h.core.fill_chunks;
++        }
+         const add = h.core.addStream(&job.stream);
++        h.core.fill_first = fill_first;
+         h.recordSpan(.admission, span_start, job.id, r.prompt.len, job.stream.cached);
+         add catch |e| {
++            if (parent) |p| h.core.filling = &p.stream;
+             if (h.between_err != null) {
+                 _ = h.drop(job, h.words(e));
+                 return false;
+@@ -527,6 +610,12 @@
+         };
+         // Native backends restore before their first piece: release that borrow before a cut-in can replace or evict it.
+         if (job.entry) |e| if (job.stream.reuse_failed or job.stream.cached == e.at) job.reported();
++        if (parent) |p| {
++            p.used_piece_cut_in = true;
++            if (h.core.filling == &job.stream) {
++                h.parked_fill = p;
++            } else h.core.filling = &p.stream;
++        }
+         if (h.core.filling == &job.stream) {
+             h.filling = job; // its next pieces run between rounds (fillOne)
+             // Give runnable streams their first round before a cached request can cut into this new fill.
+@@ -767,12 +856,12 @@
+         const filled = h.core.fillStep();
+         h.recordSpan(.fill, span_start, job.id, job.request.prompt.len, job.stream.cached);
+         const done = filled catch |e| {
+-            h.filling = null;
++            h.restoreParkedFill();
+             _ = if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
+             return;
+         };
+         if (!done) return;
+-        h.filling = null;
++        h.restoreParkedFill();
+         h.prefilled(job, job.began);
+         if (h.deliver(job)) h.remove(job);
+     }
+@@ -833,6 +922,7 @@
+     /// A failed round ends every stream it held, with the backend's error.
+     fn failAll(h: *LaneHost, message: []const u8) void {
+         h.filling = null;
++        h.parked_fill = null;
+         h.lock();
+         const jobs = h.gpa.dupe(*Job, h.admitted.items) catch &.{};
+         h.admitted.clearRetainingCapacity();
+@@ -1053,7 +1143,7 @@
+         core.fill_rounds = 0;
+         core.cut_in = 8;
+         var snaps: probe.Snaps = .{ .target = &target };
+-        var store = pc.Store.init(gpa, snaps.snapshots(), .{ .min_prompt = 0 }, 4096);
++        var store = pc.Store.init(gpa, snaps.snapshots(), .{ .min_prompt = 0, .branch_anchors = true, .reserve_before_pass = false }, 4096);
+         defer store.deinit();
+         const short = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+         const long = short ++ [_]u32{ 9, 10, 11, 12 };
+@@ -1079,6 +1169,7 @@
+         try std.testing.expect(filling.stream.reuse.saved == null);
+         try std.testing.expectEqual(@as(u64, if (reject_restore) 0 else 1), store.counts.hits);
+         try std.testing.expectEqual(@as(u64, if (reject_restore) 1 else 0), store.counts.failed);
++        if (!reject_restore) try std.testing.expect(store.entries.items[0].branch_anchor);
+         if (!reject_restore) snaps.stale = old_saved; // Another placement made the restored source stale while this pass was paused.
+         const cut_in: Request = .{ .prompt = &short, .max_tokens = 2, .drafts = false, .history_len = 4 };
+         try engine.submit(2, &cut_in, .{ .ctx = &target, .event = probe.event });
+@@ -1086,6 +1177,7 @@
+         try std.testing.expectEqual(@as(usize, 1), snaps.drops);
+         try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
+         try std.testing.expectEqual(@as(u64, 64), store.held);
++        try std.testing.expect(!store.entries.items[0].branch_anchor); // a replacement must earn its own successful restore
+         try std.testing.expectEqual(@as(u64, 0), store.counts.evicted);
+         host.fillOne();
+         try std.testing.expect(host.filling == null);
+@@ -1201,3 +1293,224 @@
+     try std.testing.expectEqualSlices(u32, &long, target.lanes.get(&filling.stream).?.history.items[0..long.len]);
+     try std.testing.expect(host.admitOne());
+ }
++
++test "cached-piece admission: off waits; on bounds each piece, decodes, resumes parent and preserves tokens" {
++    for ([_]bool{ false, true }) |enabled| {
++        const probe = @import("cache_refresh_borrow_test.zig");
++        const gpa = std.testing.allocator;
++        var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++        defer cfg.deinit(gpa);
++        var target: lanes.fake.Fake = .{ .gpa = gpa };
++        defer target.deinit();
++        var clock: lanes.fake.FixedClock = .{};
++        var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++        defer core.deinit();
++        var snaps: probe.Snaps = .{ .target = &target };
++        var store = pc.Store.init(gpa, snaps.snapshots(), .{ .min_prompt = 0 }, 4096);
++        defer store.deinit();
++        const medium = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
++        const cold: [16]u32 = @splat(9);
++        const decode = [_]u32{ 2, 1 };
++        var seed = try lanes.Stream.init(gpa, .{ .id = "seed", .prompt = medium[0..4], .max_new = 1, .drafts = false });
++        defer seed.deinit(gpa);
++        try target.backend().prefill(&seed);
++        try std.testing.expect(store.keep(&medium, 4, &seed, &.{}));
++        target.backend().release(&seed);
++        var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 8 });
++        host.cache = &store;
++        host.cached_fill_limit = if (enabled) 8 else 0;
++        defer { host.closeAll(); host.stop(); }
++        const sink: Sink = .{ .ctx = &target, .event = probe.event };
++        const decoding: Request = .{ .prompt = &decode, .max_tokens = 40, .drafts = false };
++        try host.engine().submit(1, &decoding, sink);
++        _ = host.admitOne();
++        const decoder = host.admitted.items[0];
++        core.fill_chunks = 1;
++        core.fill_first = 3; // the new cut-in must still use one chunk, not this wider first piece
++        core.fill_rounds = 2;
++        core.cut_in = 4;
++        core.cut_in_reuse = true;
++        target.prefill_chunks = 6;
++        const blocker: Request = .{ .prompt = &cold, .max_tokens = 20, .drafts = false };
++        try host.engine().submit(2, &blocker, sink);
++        _ = host.admitOne();
++        const parent = host.filling.?;
++        const request: Request = .{ .prompt = &medium, .max_tokens = 20, .drafts = false };
++        try std.testing.expect(!host.canPieceCutIn(&request, 0)); // no cold fallbacks
++        try std.testing.expect(!host.canPieceCutIn(&request, 6)); // existing short-tail path stays unchanged
++        try std.testing.expect(!host.canPieceCutIn(&request, 1)); // over the new bound
++        var image_request = request;
++        const images = [_]lanes.stream.Image{.{ .at = 0, .tokens = 1, .bytes = "" }};
++        image_request.images = &images;
++        try std.testing.expect(!host.canPieceCutIn(&image_request, 4));
++        try host.engine().submit(3, &request, sink);
++        const before = target.prefill_count;
++        _ = host.admitOne();
++        if (!enabled) {
++            try std.testing.expectEqual(before, target.prefill_count);
++            try std.testing.expectEqual(parent, host.filling.?);
++            try std.testing.expectEqual(@as(usize, 1), host.queued.items.len);
++            continue;
++        }
++        const child = host.filling.?;
++        try std.testing.expect(child != parent);
++        try std.testing.expectEqual(parent, host.parked_fill.?);
++        try std.testing.expectEqual(before + 1, target.prefill_count);
++        try std.testing.expectEqual(@as(u32, 3), core.fill_first);
++        const emitted_before = decoder.stream.emitted().len;
++        // No third prefill can overwrite the backend's single paused Fill.
++        try host.engine().submit(4, &decoding, sink);
++        try std.testing.expect(!host.admitOne());
++        for (0..5) |_| {
++            const chunks_before = target.prefill_count;
++            host.fillOne();
++            try std.testing.expectEqual(chunks_before, target.prefill_count);
++            try core.step();
++            host.fillOne();
++            try std.testing.expectEqual(chunks_before, target.prefill_count);
++            try core.step();
++            host.fillOne();
++            try std.testing.expectEqual(chunks_before + 1, target.prefill_count);
++        }
++        try std.testing.expect(decoder.stream.emitted().len > emitted_before);
++        try std.testing.expectEqual(parent, host.filling.?);
++        try std.testing.expect(host.parked_fill == null);
++        try std.testing.expectEqual(@as(u32, 4), child.stream.cached);
++        try std.testing.expect(!host.canPieceCutIn(&request, 4)); // one opportunity per parent, no starvation
++        try std.testing.expectEqual(@as(u64, 1), store.counts.hits);
++        try std.testing.expectEqual(lanes.fake.next(&medium, null, medium.len), child.stream.emitted()[0]);
++        for (0..3) |_| { try core.step(); try core.step(); host.fillOne(); }
++        try std.testing.expect(host.filling == null);
++        try std.testing.expectEqual(lanes.fake.next(&cold, null, cold.len), parent.stream.emitted()[0]);
++    }
++}
++
++test "cached-piece admission: cancelling either parked or active fill leaves the survivor schedulable" {
++    for ([_]bool{ false, true }) |cancel_parent| {
++        const probe = @import("cache_refresh_borrow_test.zig");
++        const gpa = std.testing.allocator;
++        var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++        defer cfg.deinit(gpa);
++        var target: lanes.fake.Fake = .{ .gpa = gpa };
++        defer target.deinit();
++        var clock: lanes.fake.FixedClock = .{};
++        var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++        defer core.deinit();
++        var snaps: probe.Snaps = .{ .target = &target };
++        var store = pc.Store.init(gpa, snaps.snapshots(), .{ .min_prompt = 0 }, 4096);
++        defer store.deinit();
++        const medium = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
++        const cold: [16]u32 = @splat(9);
++        var seed = try lanes.Stream.init(gpa, .{ .id = "seed", .prompt = medium[0..4], .max_new = 1, .drafts = false });
++        defer seed.deinit(gpa);
++        try target.backend().prefill(&seed);
++        try std.testing.expect(store.keep(&medium, 4, &seed, &.{}));
++        target.backend().release(&seed);
++        var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 8 });
++        host.cache = &store;
++        host.cached_fill_limit = 8;
++        defer { host.closeAll(); host.stop(); }
++        core.fill_chunks = 1;
++        core.fill_rounds = 2;
++        core.cut_in = 4;
++        core.cut_in_reuse = true;
++        target.prefill_chunks = 3;
++        const sink: Sink = .{ .ctx = &target, .event = probe.event };
++        const blocker: Request = .{ .prompt = &cold, .max_tokens = 20, .drafts = false };
++        const request: Request = .{ .prompt = &medium, .max_tokens = 20, .drafts = false };
++        try host.engine().submit(1, &blocker, sink);
++        _ = host.admitOne();
++        const parent = host.filling.?;
++        try host.engine().submit(2, &request, sink);
++        _ = host.admitOne();
++        const child = host.filling.?;
++        const survivor = if (cancel_parent) child else parent;
++        host.engine().cancel(if (cancel_parent) 1 else 2);
++        host.takeCancels();
++        try std.testing.expectEqual(survivor, host.filling.?);
++        try std.testing.expect(host.parked_fill == null);
++        try std.testing.expectEqual(&survivor.stream, core.filling.?);
++        host.fillOne(); host.fillOne();
++        try std.testing.expect(host.filling == null);
++        try std.testing.expectEqual(lanes.fake.next(survivor.request.prompt, null, survivor.request.prompt.len), survivor.stream.emitted()[0]);
++    }
++}
++
++test "cached-piece admission: restore refusal and pressure preserve parent; later piece failure also resumes it" {
++    const probe = @import("cache_refresh_borrow_test.zig");
++    const Scenario = struct {
++        failure: anyerror,
++        later: bool,
++        calls: usize = 0,
++        fn part(ptr: *anyopaque, s: *lanes.Stream, chunks: usize) anyerror!bool {
++            const target: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++            const x: *@This() = @ptrCast(@alignCast(target.prefill_hook_ctx.?));
++            if (s.cut_in_limit > 0) {
++                x.calls += 1;
++                if (!x.later or x.calls > 1) return x.failure;
++            }
++            const be = target.backend();
++            return be.vtable.prefill_part.?(be.ptr, s, chunks);
++        }
++        fn backend(target: *lanes.fake.Fake) lanes.backend.Backend {
++            const table: lanes.backend.Backend.VTable = comptime blk: {
++                var unused: lanes.fake.Fake = undefined;
++                var v = unused.backend().vtable.*;
++                v.prefill_part = part;
++                break :blk v;
++            };
++            return .{ .ptr = target, .vtable = &table };
++        }
++    };
++    for ([_]anyerror{ error.FillBusy, error.ContextFull, error.InjectedPieceFailure }) |failure| {
++        const gpa = std.testing.allocator;
++        var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++        defer cfg.deinit(gpa);
++        var scenario: Scenario = .{ .failure = failure, .later = failure == error.InjectedPieceFailure };
++        var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_hook_ctx = &scenario };
++        defer target.deinit();
++        var clock: lanes.fake.FixedClock = .{};
++        var core = lanes.Engine.init(gpa, &cfg, Scenario.backend(&target), clock.clock());
++        defer core.deinit();
++        var snaps: probe.Snaps = .{ .target = &target };
++        var store = pc.Store.init(gpa, snaps.snapshots(), .{ .min_prompt = 0 }, 4096);
++        defer store.deinit();
++        const medium = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
++        const cold: [16]u32 = @splat(9);
++        var seed = try lanes.Stream.init(gpa, .{ .id = "seed", .prompt = medium[0..4], .max_new = 1, .drafts = false });
++        defer seed.deinit(gpa);
++        try target.backend().prefill(&seed);
++        try std.testing.expect(store.keep(&medium, 4, &seed, &.{}));
++        target.backend().release(&seed);
++        var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 8 });
++        host.cache = &store;
++        host.cached_fill_limit = 8;
++        defer { host.closeAll(); host.stop(); }
++        core.fill_chunks = 1;
++        core.fill_rounds = 2;
++        core.cut_in = 4;
++        core.cut_in_reuse = true;
++        target.prefill_chunks = 3;
++        const sink: Sink = .{ .ctx = &target, .event = probe.event };
++        const blocker: Request = .{ .prompt = &cold, .max_tokens = 20, .drafts = false };
++        const request: Request = .{ .prompt = &medium, .max_tokens = 20, .drafts = false };
++        try host.engine().submit(1, &blocker, sink);
++        _ = host.admitOne();
++        const parent = host.filling.?;
++        try host.engine().submit(2, &request, sink);
++        _ = host.admitOne();
++        if (scenario.later) host.fillOne();
++        try std.testing.expectEqual(parent, host.filling.?);
++        try std.testing.expectEqual(&parent.stream, core.filling.?);
++        try std.testing.expect(host.parked_fill == null);
++        try std.testing.expectEqual(@as(usize, if (scenario.later) 0 else 1), host.queued.items.len);
++        if (failure == error.FillBusy) {
++            try std.testing.expect(!host.admitOne());
++            try std.testing.expectEqual(@as(usize, 1), scenario.calls);
++        }
++        host.fillOne(); host.fillOne();
++        try std.testing.expect(host.filling == null);
++        try std.testing.expectEqual(lanes.fake.next(&cold, null, cold.len), parent.stream.emitted()[0]);
++        try std.testing.expectEqual(@as(u64, 0), store.counts.failed);
++    }
++}
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -42,6 +42,8 @@
+ pub const Rules = struct {
+     /// Reserve before the pass when a peer receives snapshot drops only with the next request.
+     reserve_before_pass: bool = true,
++    /// Successful restores retain one exact ancestor per path; requires keep-time (not pre-pass) eviction.
++    branch_anchors: bool = false,
+     /// Tokens past the position a state read (Flash Next's MTP head keys row at-1 with token at: 1).
+     lookahead: u32 = 0,
+     /// Prompt kernels that change arithmetic with a chunk's rows: resume and keep only at the request's chunk starts.
+@@ -62,6 +64,7 @@
+     born: u32, // the length of the prompt that kept it: a later turn's is longer
+     used: u64, // the store's clock at its last keep or resume
+     last: []u32, // the last prompt that kept or resumed it
++    branch_anchor: bool = false, // soft retention only; never a pin or a learned shared cut
+     shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
+ };
+ 
+@@ -84,6 +87,7 @@
+     counts: Counts = .{},
+     shared_keys: std.ArrayList(u64) = .empty, // the tokens of recently planned shared cuts, hashed (at most SHARED_KEYS)
+     imprint: ?*imprint.Imprint = null, // --learn: shared cuts' states on disk, read back by later sessions and servers
++    protected: []const *Entry = &.{}, // operation-local deepest matches needed by queued jobs or pending restores
+ 
+     const SHARED_KEYS = 64;
+ 
+@@ -119,6 +123,22 @@
+     /// What the budget leaves past the kept states and the spare storage: a family readies storage only inside it.
+     pub fn room(s: *const Store) u64 {
+         return s.budget -| s.held -| s.spare();
++    }
++
++    fn protectedEntry(s: *const Store, e: *Entry) bool {
++        return std.mem.indexOfScalar(*Entry, s.protected, e) != null;
++    }
++
++    /// Refuse an impossible guarded save before destroying any unprotected states.
++    /// Spare storage that can be trimmed is not a live state; the budget never grows.
++    fn canMakeRoom(s: *const Store, skip: ?*Entry, bytes: u64) bool {
++        if (s.protected.len == 0) return true; // preserve the existing unguarded policy
++        var retained: u64 = 0;
++        for (s.entries.items) |e| if (e == skip or s.protectedEntry(e)) {
++            retained +|= e.bytes;
++        };
++        if (s.family.vtable.trim == null) retained +|= s.spare();
++        return bytes <= s.budget -| retained;
+     }
+ 
+     /// Whether a state at `at` may start or end a prompt pass: anywhere, or a chunk start for planned families.
+@@ -171,6 +191,7 @@
+     fn reserve(s: *Store, prompt: []const u32, from: ?*Entry, marks_: []const u32) void {
+         var need: u64 = 0;
+         for (marks_) |at| need += s.family.vtable.bytes(s.family.ptr, at);
++        if (!s.canMakeRoom(from, need)) return;
+         while (s.held + need > s.budget) {
+             const i = s.victimBut(from, prompt) orelse return;
+             s.remove(i);
+@@ -218,12 +239,44 @@
+             s.counts.failed += 1;
+             return s.remove(i);
+         }
++        if (s.rules.branch_anchors and !s.rules.reserve_before_pass) s.touchAnchor(e);
+         s.clock += 1;
+         e.used = s.clock;
+         s.counts.hits += 1;
+         const last = s.gpa.dupe(u32, prompt) catch return;
+         s.gpa.free(e.last);
+         e.last = last;
++    }
++
++    /// Called only after a successful restore, while the entry is still owned by this store.
++    /// Keep the earliest retained ancestor across linear extensions; never retain a Job pointer.
++    fn touchAnchor(s: *Store, restored: *Entry) void {
++        // A successful descendant restore also uses its exact shared system cuts.
++        // Refresh them before the branch root so protecting a deep history does not
++        // leave its reusable system cut as an artificially cold ordinary-LRU victim.
++        // Shared cuts remain separate from branch anchors and keep their learning rules.
++        for (s.entries.items) |e| {
++            if (e.shared and e != restored and std.mem.startsWith(u32, restored.tokens, e.tokens)) {
++                s.clock += 1;
++                e.used = s.clock;
++            }
++        }
++        // A shared restore must neither capture all deeper roots nor normalize them away.
++        if (restored.shared) return;
++        var anchor = restored;
++        for (s.entries.items) |e| {
++            if (!e.shared and e.branch_anchor and e.tokens.len <= anchor.tokens.len and
++                std.mem.startsWith(u32, restored.tokens, e.tokens)) anchor = e;
++        }
++        // A newly restored earlier checkpoint can subsume existing descendant anchors.
++        // Normalize every descendant so each exact token path has at most one anchor.
++        for (s.entries.items) |e| {
++            if (e.branch_anchor and e != anchor and std.mem.startsWith(u32, e.tokens, anchor.tokens))
++                e.branch_anchor = false;
++        }
++        anchor.branch_anchor = true;
++        s.clock += 1;
++        anchor.used = s.clock; // touch the ancestor before the restored tip
+     }
+ 
+     /// Where a pass from `from` keeps states: the history, then min_gap apart the stable prefix and shared blocks.
+@@ -269,12 +322,18 @@
+             };
+             e.used = s.clock; // the same state again: no copy
+             e.shared = e.shared or shared;
++            if (e.shared) e.branch_anchor = false;
+             return true;
+         };
+         const bytes = s.family.vtable.bytes(s.family.ptr, at);
+         if (bytes > s.budget) {
+             s.counts.refused += 1;
+             note("kept nothing at {d} tokens: {d} MiB passes the {d} MiB budget", .{ at, bytes >> 20, s.budget >> 20 });
++            return false;
++        }
++        const reuses = if (s.family.vtable.reuses) |f| f(s.family.ptr, at) else false;
++        if ((replacement != null and s.protectedEntry(replacement.?)) or (!reuses and !s.canMakeRoom(null, bytes))) {
++            s.counts.refused += 1;
+             return false;
+         }
+         while (s.entries.items.len > 0) { // room: spare storage this save can take, else new storage inside the budget
+@@ -285,7 +344,10 @@
+                 if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
+                 if (s.spare() < free_) continue;
+             }
+-            const victim = if (replacement) |old| std.mem.indexOfScalar(*Entry, s.entries.items, old).? else s.victimBut(null, prompt).?;
++            const victim = (if (replacement) |old| std.mem.indexOfScalar(*Entry, s.entries.items, old) else s.victimBut(null, prompt)) orelse {
++                s.counts.refused += 1;
++                return false;
++            };
+             replacement = null; // this old object must go before the save to fit; otherwise keep it until a successful save
+             s.remove(victim); // its storage may come back spare and take this state
+             s.counts.evicted += 1;
+@@ -345,6 +407,7 @@
+         const read = s.family.vtable.read orelse return have;
+         const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
+         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
++        if (!s.canMakeRoom(have, bytes)) return have;
+         while (bytes <= s.budget and s.held + s.spare() + bytes > s.budget) {
+             s.remove(s.victimBut(have, prompt) orelse return have);
+             s.counts.evicted += 1;
+@@ -388,20 +451,23 @@
+         return false;
+     }
+ 
+-    /// The entry to free first, never `skip` (a pass's resume): one a later prompt extends (never a shared cut), oldest first; else the oldest.
++    /// The entry to free first, never `skip` (a pass's resume): one a later prompt extends (never a shared cut or soft anchor), oldest first; else the oldest.
+     fn victimBut(s: *const Store, skip: ?*Entry, prompt: []const u32) ?usize {
+         var best: ?usize = null;
+         for (s.entries.items, 0..) |e, i| {
+-            if (e.shared or e == skip) continue; // a shared cut is evicted only as the least recently used
++            if (s.protectedEntry(e) or e.shared or (s.rules.branch_anchors and !s.rules.reserve_before_pass and e.branch_anchor) or e == skip) continue; // soft anchors still participate in ordinary LRU
+             const now = prompt.len > e.born and prompt.len > e.tokens.len and std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens); // this prompt extends it
+             const moved_on = now or for (s.entries.items) |o| {
+-                if (o != e and o.born > e.born and o.used >= e.used and o.tokens.len > e.tokens.len and std.mem.eql(u32, o.tokens[0..e.tokens.len], e.tokens)) break true;
++                // Backed snapshots may keep both a stable cut and history in one pass.
++                // Its shorter non-anchor cut is redundant once the exact longer tip exists.
++                const later = o.born > e.born or (s.rules.branch_anchors and !s.rules.reserve_before_pass and o.born == e.born);
++                if (o != e and later and o.used >= e.used and o.tokens.len > e.tokens.len and std.mem.eql(u32, o.tokens[0..e.tokens.len], e.tokens)) break true;
+             } else false;
+             if (moved_on and (best == null or e.used < s.entries.items[best.?].used)) best = i;
+         }
+         if (best) |i| return i;
+         var oldest: ?usize = null;
+-        for (s.entries.items, 0..) |e, i| if (e != skip and (oldest == null or e.used < s.entries.items[oldest.?].used)) {
++        for (s.entries.items, 0..) |e, i| if (e != skip and !s.protectedEntry(e) and (oldest == null or e.used < s.entries.items[oldest.?].used)) {
+             oldest = i;
+         };
+         return oldest;
+--- a/zig/src/core/prompt_cache_test.zig
++++ b/zig/src/core/prompt_cache_test.zig
+@@ -15,6 +15,7 @@
+     pending: u64 = 0,
+     max: u64 = 0,
+     in_pass: bool = false,
++    immediate: bool = false, // backed snapshots synchronize drops before the next save
+ 
+     fn request(p: *Peer) void {
+         p.held -= p.pending;
+@@ -126,7 +127,7 @@
+         const f = of(ptr);
+         const st: *State = @ptrCast(@alignCast(saved));
+         if (f.peer) |p| { // dropped before the pass: named in this request; during it: in the next one
+-            if (p.in_pass) p.pending += 100 + st.at else p.held -= 100 + st.at;
++            if (p.in_pass and !p.immediate) p.pending += 100 + st.at else p.held -= 100 + st.at;
+         }
+         f.gpa.destroy(st);
+         f.live -= 1;
+@@ -494,3 +495,345 @@
+     try std.testing.expectEqual(fresh(&p3), g.pass(&t, &p3, plan));
+     try std.testing.expect(im.has(imprint.Imprint.keyOf(&two))); // learned again by that pass
+ }
++
++
++// Real Store regression: the disabled control reproduces the superseded-first loss.
++test "branch anchors: keep-time pressure preserves restored A and exact branch-back state, off keeps old policy" {
++    for ([_]bool{ false, true }) |enabled| {
++        const gpa = std.testing.allocator;
++        var arena: std.heap.ArenaAllocator = .init(gpa);
++        defer arena.deinit();
++        var f: Fake = .{ .gpa = gpa };
++        var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0, .reserve_before_pass = false, .branch_anchors = enabled }, 220);
++        defer s.deinit();
++        const other = [_]u32{ 9, 9, 9, 9 };
++        const a = [_]u32{ 1, 2, 3, 4, 5, 6 };
++        const b = a ++ [_]u32{ 7, 8 };
++        const branch = [_]u32{ 1, 2, 3, 4, 90, 91, 92 };
++        _ = f.pass(&s, &other, .{ .marks = &.{3} });
++        _ = f.pass(&s, &a, .{ .marks = &.{4} });
++        const plan = try s.begin(arena.allocator(), &b, 6, &.{}, &.{}, null);
++        try std.testing.expectEqual(@as(u32, 4), plan.from);
++        try std.testing.expectEqual(fresh(&b), f.pass(&s, &b, plan));
++        try std.testing.expectEqual(!enabled, s.find(&other, &.{}) != null);
++        const back = try s.begin(arena.allocator(), &branch, 0, &.{}, &.{}, null);
++        try std.testing.expectEqual(@as(u32, if (enabled) 4 else 0), back.from);
++        try std.testing.expectEqual(fresh(&branch), f.pass(&s, &branch, back));
++        try std.testing.expectEqual(@as(u64, 1), s.counts.evicted);
++        try std.testing.expect(s.held <= s.budget);
++        try std.testing.expectEqual(s.entries.items.len, f.live);
++    }
++}
++
++test "branch anchors: A survives A B C, successful restore touches ancestor before tip and lookup never touches" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0, .reserve_before_pass = false, .branch_anchors = true }, 220);
++    defer s.deinit();
++    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
++    _ = f.pass(&s, tokens[0..6], .{ .marks = &.{4} });
++    const anchor = s.entries.items[0];
++    const used0 = anchor.used;
++    const found = try s.lookup(arena.allocator(), tokens[0..8], 6, &.{}, &.{});
++    try std.testing.expect(found.entry.? == anchor);
++    try std.testing.expect(!anchor.branch_anchor);
++    try std.testing.expectEqual(used0, anchor.used);
++    try s.family.vtable.restore(s.family.ptr, null, anchor.saved);
++    s.resumed(anchor, tokens[0..8], true);
++    _ = f.pass(&s, tokens[0..8], .{ .from = 4, .marks = found.marks });
++    const tip = s.find(tokens[0..10], &.{}).?;
++    const next = try s.begin(arena.allocator(), tokens[0..10], 8, &.{}, &.{}, null);
++    try std.testing.expect(anchor.used < tip.used);
++    try std.testing.expect(anchor.branch_anchor and !tip.branch_anchor);
++    try std.testing.expectEqual(fresh(tokens[0..10]), f.pass(&s, tokens[0..10], next));
++    try std.testing.expectEqual(anchor, s.find(&.{ 1, 2, 3, 4, 70, 71 }, &.{}).?);
++    var anchors: usize = 0;
++    for (s.entries.items) |e| { if (e.branch_anchor) { anchors += 1; try std.testing.expect(e == anchor); } }
++    try std.testing.expectEqual(@as(usize, 1), anchors);
++}
++
++test "branch anchors: saved-descendant eviction class also excludes anchors and cold roots eventually age out" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0, .reserve_before_pass = false, .branch_anchors = true }, 330);
++    defer s.deinit();
++    const path = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
++    const other = [_]u32{ 90, 91, 92, 93 };
++    _ = f.pass(&s, &other, .{ .marks = &.{3} });
++    _ = f.pass(&s, path[0..6], .{ .marks = &.{4} });
++    _ = f.pass(&s, &path, try s.begin(arena.allocator(), &path, 6, &.{}, &.{}, null));
++    _ = f.pass(&s, &.{ 80, 81, 82, 83 }, .{ .marks = &.{3} });
++    try std.testing.expect(s.find(&other, &.{}) == null); // ordinary oldest, not A despite saved B
++    try std.testing.expectEqual(@as(u32, 4), s.find(&.{ 1, 2, 3, 4, 70 }, &.{}).?.at);
++    // More unrelated traffic is allowed to retire the soft root through ordinary LRU.
++    for ([_]u32{ 60, 50, 40 }) |token| {
++        const cold = [_]u32{ token, token, token, token };
++        _ = f.pass(&s, &cold, .{ .marks = &.{3} });
++        try std.testing.expect(s.held <= s.budget);
++    }
++    try std.testing.expect(s.find(&.{ 1, 2, 3, 4, 70 }, &.{}) == null);
++}
++
++test "branch anchors: exact sibling keys and earlier restored ancestor normalize redundant roots" {
++    const gpa = std.testing.allocator;
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0, .lookahead = 1, .reserve_before_pass = false, .branch_anchors = true }, 1000);
++    defer s.deinit();
++    const one = [_]u32{ 1, 2, 3, 4, 5, 6, 7 };
++    const two = [_]u32{ 1, 2, 3, 4, 50, 60, 70 };
++    _ = f.pass(&s, &one, .{ .marks = &.{4} });
++    _ = f.pass(&s, &two, .{ .marks = &.{4} });
++    const a = s.find(&one, &.{}).?;
++    const b = s.find(&two, &.{}).?;
++    try std.testing.expect(a != b);
++    try s.family.vtable.restore(s.family.ptr, null, a.saved); s.resumed(a, &one, true);
++    const a_used = a.used;
++    try s.family.vtable.restore(s.family.ptr, null, b.saved); s.resumed(b, &two, true);
++    try std.testing.expect(a.branch_anchor and b.branch_anchor);
++    try std.testing.expectEqual(a_used, a.used); // same position but differing lookahead never refreshes sibling
++    _ = f.pass(&s, &one, .{ .marks = &.{2} });
++    const earlier = s.find(&.{ 1, 2, 3, 99 }, &.{}).?;
++    try s.family.vtable.restore(s.family.ptr, null, earlier.saved); s.resumed(earlier, &one, true);
++    try std.testing.expect(earlier.branch_anchor and !a.branch_anchor and !b.branch_anchor);
++    try std.testing.expectEqual(@as(usize, 0), s.shared_keys.items.len);
++    try std.testing.expect(!earlier.shared);
++}
++
++test "branch anchors: failed restore never refreshes ancestor, failed save stays bounded, new root can be earned" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0, .reserve_before_pass = false, .branch_anchors = true }, 220);
++    defer s.deinit();
++    const path = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
++    _ = f.pass(&s, path[0..6], .{ .marks = &.{4} });
++    _ = f.pass(&s, path[0..8], try s.begin(arena.allocator(), path[0..8], 6, &.{}, &.{}, null));
++    const root = s.entries.items[0];
++    const used = root.used;
++    f.fail_restore = true;
++    const failed = try s.begin(arena.allocator(), &path, 8, &.{}, &.{}, null);
++    try std.testing.expectEqual(@as(u32, 0), failed.from);
++    try std.testing.expectEqual(used, root.used);
++    try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
++    f.fail_save = true;
++    _ = f.pass(&s, &path, failed);
++    try std.testing.expectEqual(@as(u64, 2), s.counts.failed);
++    try std.testing.expect(s.held <= s.budget);
++    s.forget(&path, 4);
++    try std.testing.expectEqual(@as(usize, 0), s.entries.items.len);
++    f.fail_restore = false; f.fail_save = false;
++    _ = f.pass(&s, &path, .{ .marks = &.{6} });
++    const recovered = try s.begin(arena.allocator(), &path, 0, &.{}, &.{}, null);
++    try std.testing.expectEqual(@as(u32, 6), recovered.from);
++    try std.testing.expect(s.entries.items[0].branch_anchor);
++    try std.testing.expectEqual(fresh(&path), f.pass(&s, &path, recovered));
++}
++
++test "branch anchors: eight interleaved paths keep exact state with immediate peer drops inside finite budget" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    var peer: Peer = .{ .immediate = true };
++    var f: Fake = .{ .gpa = gpa, .peer = &peer };
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0, .reserve_before_pass = false, .branch_anchors = true }, 1744);
++    defer s.deinit();
++    var paths: [8][16]u32 = undefined;
++    for (&paths, 0..) |*path, lane| for (path, 0..) |*token, i| { token.* = @intCast(lane * 100 + i + 1); };
++    for ([_]u32{ 6, 8, 10, 12 }) |len| {
++        for (&paths) |*path| {
++            const prompt = path[0..len];
++            const plan = try s.begin(arena.allocator(), prompt, len - 2, &.{}, &.{}, null);
++            try std.testing.expectEqual(fresh(prompt), f.pass(&s, prompt, plan));
++            try std.testing.expectEqual(s.held, peer.held);
++            try std.testing.expectEqual(@as(u64, 0), peer.pending);
++            try std.testing.expect(peer.max <= s.budget);
++            try std.testing.expectEqual(s.entries.items.len, f.live);
++        }
++    }
++    for (&paths) |*path| {
++        var back: [7]u32 = undefined;
++        @memcpy(back[0..4], path[0..4]); back[4] = 900; back[5] = 901; back[6] = 902;
++        const plan = try s.begin(arena.allocator(), &back, 0, &.{}, &.{}, null);
++        try std.testing.expectEqual(@as(u32, 4), plan.from);
++        try std.testing.expectEqual(fresh(&back), f.pass(&s, &back, plan));
++    }
++    // A smaller budget cannot promise all sixteen states; fairness permits roots to leave.
++    s.budget = 220;
++    _ = f.pass(&s, &.{ 999, 999, 999, 999 }, .{ .marks = &.{3} });
++    try std.testing.expect(s.held <= s.budget);
++    try std.testing.expectEqual(s.held, peer.held);
++    try std.testing.expectEqual(@as(u64, 0), peer.pending);
++    try std.testing.expect(s.counts.evicted > 0);
++    try std.testing.expect(s.entries.items.len <= 2);
++}
++
++test "branch anchors enabled: kept states charge their real storage, a save takes spare storage first, and spare stays inside the budget" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.pooled(), .{ .branch_anchors = true, .min_prompt = 0 }, 330); // new storage 100 + at, a kept state 90 + at
++    defer s.deinit();
++    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6 };
++    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null));
++    try std.testing.expectEqual(@as(u64, 94), s.held);
++    f.spare_bytes = 120; // a buffer readied while idle
++    try std.testing.expectEqual(@as(u64, 116), s.room());
++    const other = [_]u32{ 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5 };
++    _ = f.pass(&s, &other, try s.begin(a, &other, 10, &.{}, &.{}, null)); // takes the readied buffer: nothing evicted
++    try std.testing.expectEqual(@as(u64, 194), s.held);
++    try std.testing.expectEqual(@as(u64, 20), s.spare());
++    try std.testing.expectEqual(@as(u64, 0), s.counts.evicted);
++    var t2: [102]u32 = undefined;
++    for (&t2, 1..) |*t, i| t.* = @intCast(i);
++    _ = f.pass(&s, &t2, try s.begin(a, &t2, 101, &.{}, &.{}, null)); // resumes t1's; 201 new: the spare shrinks, then `other` goes
++    try std.testing.expectEqual(@as(u64, 1), s.counts.evicted);
++    try std.testing.expectEqual(@as(u64, 94 + 191), s.held);
++    try std.testing.expect(s.held + s.spare() <= s.budget);
++    try std.testing.expectEqual(s.entries.items.len, f.live);
++}
++
++test "branch anchors enabled: a shared system cut outlives its own conversation's turns: a second conversation resumes it after cold prompts fill the budget" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var peer: Peer = .{ .immediate = true };
++    var f: Fake = .{ .gpa = gpa, .peer = &peer };
++    var s = Store.init(gpa, f.snapshots(), .{ .branch_anchors = true, .reserve_before_pass = false, .min_prompt = 0, .min_gap = 1 }, 600); // bytes 100 + at
++    defer s.deinit();
++    var c1: [30]u32 = @splat(9);
++    var c2: [30]u32 = @splat(8);
++    for ([_][]u32{ &c1, &c2 }) |c| { // cold prompts first
++        _ = f.pass(&s, c, try s.begin(a, c, 29, &.{}, &.{}, null));
++        try std.testing.expect(s.held <= s.budget);
++    }
++    var conv: [45]u32 = undefined;
++    for (&conv, 1..) |*t, i| t.* = @intCast(i); // a 20-token system block, then the turns
++    for ([_]u32{ 25, 35, 45 }, [_]u32{ 24, 34, 44 }) |len, history| {
++        _ = f.pass(&s, conv[0..len], try s.begin(a, conv[0..len], history, &.{20}, &.{}, null));
++        try std.testing.expect(s.held <= s.budget);
++    }
++    const shared = s.find(conv[0..21], &.{}).?;
++    try std.testing.expect(shared.shared and !shared.branch_anchor);
++    const root = s.find(conv[0..25], &.{}).?;
++    try std.testing.expect(root.branch_anchor and root.at == 24);
++    var c3: [60]u32 = @splat(7);
++    _ = f.pass(&s, &c3, try s.begin(a, &c3, 59, &.{}, &.{}, null));
++    try std.testing.expect(s.held <= s.budget);
++    var other: [25]u32 = undefined;
++    @memcpy(other[0..20], conv[0..20]);
++    for (other[20..], 0..) |*t, i| t.* = @intCast(90 + i);
++    const plan = try s.begin(a, &other, 24, &.{20}, &.{}, null);
++    try std.testing.expectEqual(@as(u32, 20), plan.from); // the cut survived the first conversation's turns
++    try std.testing.expectEqual(fresh(&other), f.pass(&s, &other, plan));
++    try std.testing.expect(s.held <= s.budget);
++    try std.testing.expectEqual(s.held, peer.held);
++    try std.testing.expect(peer.max <= s.budget);
++}
++
++test "branch anchors legacy reservation flag preserves defaults: a shared system cut outlives its own conversation's turns: a second conversation resumes it after cold prompts fill the budget" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.snapshots(), .{ .branch_anchors = true, .min_prompt = 0, .min_gap = 1 }, 600); // bytes 100 + at
++    defer s.deinit();
++    var c1: [30]u32 = @splat(9);
++    var c2: [30]u32 = @splat(8);
++    for ([_][]u32{ &c1, &c2 }) |c| { // cold prompts first
++        _ = f.pass(&s, c, try s.begin(a, c, 29, &.{}, &.{}, null));
++        try std.testing.expect(s.held <= s.budget);
++    }
++    var conv: [45]u32 = undefined;
++    for (&conv, 1..) |*t, i| t.* = @intCast(i); // a 20-token system block, then the turns
++    for ([_]u32{ 25, 35, 45 }, [_]u32{ 24, 34, 44 }) |len, history| {
++        _ = f.pass(&s, conv[0..len], try s.begin(a, conv[0..len], history, &.{20}, &.{}, null));
++        try std.testing.expect(s.held <= s.budget);
++    }
++    var c3: [60]u32 = @splat(7);
++    _ = f.pass(&s, &c3, try s.begin(a, &c3, 59, &.{}, &.{}, null));
++    try std.testing.expect(s.held <= s.budget);
++    var other: [25]u32 = undefined;
++    @memcpy(other[0..20], conv[0..20]);
++    for (other[20..], 0..) |*t, i| t.* = @intCast(90 + i);
++    const plan = try s.begin(a, &other, 24, &.{20}, &.{}, null);
++    try std.testing.expectEqual(@as(u32, 20), plan.from); // the cut survived the first conversation's turns
++    try std.testing.expectEqual(fresh(&other), f.pass(&s, &other, plan));
++    try std.testing.expect(s.held <= s.budget);
++    for (s.entries.items) |e| try std.testing.expect(!e.branch_anchor);
++}
++
++
++test "branch anchors: shared restore never captures or demotes deep branch root" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    var peer: Peer = .{ .immediate = true };
++    var f: Fake = .{ .gpa = gpa, .peer = &peer };
++    var s = Store.init(gpa, f.snapshots(), .{ .branch_anchors = true, .reserve_before_pass = false, .min_prompt = 0, .min_gap = 256 }, 330);
++    defer s.deinit();
++    const path = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
++    const sibling = [_]u32{ 1, 2, 70, 71, 72 };
++    s.rules.min_gap = 1;
++    _ = f.pass(&s, path[0..6], try s.begin(arena.allocator(), path[0..6], 4, &.{2}, &.{}, null));
++    s.rules.min_gap = 256; // seed shared cut, then keep only each requested history
++    const shared = s.find(&sibling, &.{}).?;
++    try std.testing.expect(shared.shared);
++    const sibling_plan = try s.begin(arena.allocator(), &sibling, 0, &.{}, &.{}, null);
++    try std.testing.expectEqual(@as(u32, 2), sibling_plan.from);
++    try std.testing.expectEqual(fresh(&sibling), f.pass(&s, &sibling, sibling_plan));
++    try std.testing.expect(!shared.branch_anchor);
++    const deep = s.find(path[0..8], &.{}).?;
++    _ = f.pass(&s, path[0..8], try s.begin(arena.allocator(), path[0..8], 6, &.{}, &.{}, null));
++    try std.testing.expect(deep.at == 4 and deep.branch_anchor and !shared.branch_anchor);
++    _ = f.pass(&s, &sibling, try s.begin(arena.allocator(), &sibling, 0, &.{}, &.{}, null));
++    try std.testing.expect(deep.branch_anchor and !shared.branch_anchor);
++    _ = f.pass(&s, &path, try s.begin(arena.allocator(), &path, 8, &.{}, &.{}, null));
++    const branch = [_]u32{ 1, 2, 3, 4, 80, 81 };
++    const back = try s.begin(arena.allocator(), &branch, 0, &.{}, &.{}, null);
++    try std.testing.expectEqual(@as(u32, 4), back.from);
++    try std.testing.expectEqual(fresh(&branch), f.pass(&s, &branch, back));
++    const shared_used = shared.used;
++    f.fail_restore = true;
++    const failed = try s.begin(arena.allocator(), &path, 0, &.{}, &.{}, null);
++    try std.testing.expectEqual(@as(u32, 0), failed.from);
++    try std.testing.expectEqual(shared_used, shared.used);
++    try std.testing.expectEqual(s.held, peer.held);
++    try std.testing.expect(peer.max <= s.budget);
++}
++
++
++test "branch anchors: same-pass redundancy requires enabled backed policy and exact prefix, never siblings" {
++    for ([_]bool{ false, true }) |enabled| {
++        for ([_]bool{ false, true }) |reserve| {
++            for ([_]bool{ false, true }) |sibling| {
++                const gpa = std.testing.allocator;
++                var f: Fake = .{ .gpa = gpa };
++                var s = Store.init(gpa, f.snapshots(), .{ .branch_anchors = enabled, .reserve_before_pass = reserve, .min_prompt = 0 }, 330);
++                defer s.deinit();
++                const other = [_]u32{ 9, 9, 9, 9 };
++                const path = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
++                const divergent = [_]u32{ 1, 2, 3, 40, 50, 60, 70, 80, 90, 100 };
++                _ = f.pass(&s, &other, .{ .marks = &.{3} });
++                _ = f.pass(&s, &path, .{ .marks = &.{4} });
++                _ = f.pass(&s, if (sibling) &divergent else &path, .{ .marks = &.{6} });
++                try std.testing.expectEqual(s.entries.items[1].born, s.entries.items[2].born);
++                _ = f.pass(&s, &.{ 80, 81, 82, 83 }, .{ .marks = &.{3} });
++                const redundant = enabled and !reserve and !sibling;
++                try std.testing.expectEqual(redundant, s.find(&other, &.{}) != null);
++                try std.testing.expectEqual(!redundant, s.find(&.{ 1, 2, 3, 4, 99 }, &.{}) != null);
++                try std.testing.expectEqual(@as(u64, 1), s.counts.evicted);
++                try std.testing.expect(s.held <= s.budget);
++                try std.testing.expectEqual(s.entries.items.len, f.live);
++            }
++        }
++    }
++}
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -76,6 +76,8 @@
+     tail: u32 = 0,
+     /// Whether the host must evict planned snapshots before the prompt pass starts.
+     reserve_before_pass: bool = true,
++    /// Soft ancestor retention for independent backed snapshots only.
++    branch_anchors: bool = false,
+ };
+ 
+ /// The rank's model and the backend over it (what `open` hands the server, freed by `deinit`).
+@@ -156,7 +158,7 @@
+     // the pool is the model's (preallocated): a stream takes no device memory of its own
+     const L = lanes_mod.Lanes;
+     // Drops reach the peer immediately, so keep() can evict just before saving an admitted stream.
+-    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .usable = L.snapUsableFn, .tail = @intCast(st.m.cfg.window), .reserve_before_pass = false };
++    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .usable = L.snapUsableFn, .tail = @intCast(st.m.cfg.window), .reserve_before_pass = false, .branch_anchors = true };
+     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
+ }
+ 
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -998,13 +998,24 @@
+             try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.keys, null, true, ch.tmax, false, m, ih, id);
+             try tri_index.topkSelectPruned(e.t, ch.keys, n_comp_end, ch.tmax, kk, vr, out, ch.pbufs, torch_topk, m, n_comp_end);
+         } else {
+-            try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.score, null, false, null, false, m, ih, id);
+             const mrows = ch.pool + r0 * ch.pool_ms;
++            // Preserve each row's source-selected block list in the already allocated pidx.
++            // Larger prompt blocks can gather only those keys; the score layout and top-k stay unchanged.
++            const picks = ch.pidx + r0 * pk * 8;
++            const compact = pooled and c.candidate_source < li and m > tri.decode_rows;
++            if (compact) {
++                if (!sh.pool) return error.NoCandidatePool;
++                // Excluded values become -inf before the gather; every retained position is overwritten once.
++                try e.ops.applyPool(e.s, ch.score, n_comp_end, n_comp_end, cb, mrows, ch.pool_ms, m);
++                try tri_index.indexScorePool(e.t, q, k, wb, vr, n_comp_end, ch.score, picks, pk, mrows, ch.pool_ms, cb, m, ih, id);
++            } else {
++                try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.score, null, false, null, false, m, ih, id);
++            }
+             if (pooled and li == c.candidate_source) {
+                 try e.ops.blockMax(e.s, ch.score, n_comp_end, n_comp_end, cb, vr, ch.bmax, nbk, m);
+-                try e.ops.topkIndices(e.s, ch.bmax, nbk, m, nbk, pk, ch.every, ch.pidx);
+-                try e.ops.poolPick(e.s, ch.bmax, nbk, nbk, ch.pidx, pk, mrows, ch.pool_ms, 0, m);
+-            } else if (pooled and c.candidate_source < li) {
++                try e.ops.topkIndices(e.s, ch.bmax, nbk, m, nbk, pk, ch.every, picks);
++                try e.ops.poolPick(e.s, ch.bmax, nbk, nbk, picks, pk, mrows, ch.pool_ms, 0, m);
++            } else if (pooled and c.candidate_source < li and !compact) {
+                 if (!sh.pool) return error.NoCandidatePool;
+                 try e.ops.applyPool(e.s, ch.score, n_comp_end, n_comp_end, cb, mrows, ch.pool_ms, m);
+             }
+--- a/zig/src/families/dsv41/tri_index.zig
++++ b/zig/src/families/dsv41/tri_index.zig
+@@ -93,6 +93,21 @@
+     });
+ }
+ 
++/// Prompt-only candidate gather. OUT has already had applyPool applied; scatter retained scores to original columns.
++/// PICK is the source top-k block list, MASK filters the source's nonfinite/absent blocks. No score/top-k format change.
++pub fn indexScorePool(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, out: u64, pick: u64, ps: usize, mask: u64, ms: usize, block: usize, rows: usize, ih: usize, id: usize) !void {
++    std.debug.assert(rows > tri.decode_rows and block == 8);
++    const nout = ps * block;
++    try t.run("_index_score_pool", .{ u(rows), tri.cdiv(nout, tile), 1 }, &.{
++        p("Q", "*bf16", q), p("K", k.ty(), k.codes()), p("KS", k.ty(), k.scales()), p("Wt", "*bf16", w),
++        p("VIS", "*i64", vis), p("OUT", "*fp32", out), int("n", n), int("rows", rows),
++        p("PICK", "*i64", pick), p("MASK", "*u8", mask), int("ps", ps), int("ms", ms), int("nout", nout),
++    }, &.{
++        ci("IH", ih), ci("ID", id), ci("BN", tile), ci("RB", 1), cb("PACKED", k == .fp4),
++        cb("KEYS", false), cb("HAS_TMAX", false), cb("TREE", true), ci("CB", block),
++    });
++}
++
+ /// index_keys: index_score's int64 keys (decode windows), apply_candidates' mask folded in; pruned_k: topk_select_pruned's k.
+ pub fn indexKeys(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, base: ?u64, cand: ?Cand, cand_block: usize, tmax: ?u64, pruned_k: usize, out: u64, rows: usize, ih: usize, id: usize) !void {
+     std.debug.assert(rows <= tri.decode_rows);
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -202,6 +202,8 @@
+         h.core.cut_in = envInt("TF_FILL_CUT_IN") orelse 0;
+         h.core.cut_in_reuse = h.cut_in_reuse;
+         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
++        // Opt-in cached-tail service in bounded pieces; whole-pass TF_FILL_CUT_IN is unchanged.
++        h.host.cached_fill_limit = if (h.cut_in_reuse) envInt("TF_CACHED_FILL_PIECES_MAX") orelse 0 else 0;
+         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
+         h.host.explain = explain;
+         if (h.cache) |*store| h.host.cache = store;
+@@ -399,6 +401,7 @@
+             h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{
+                 .tail = if (@hasField(@TypeOf(sn), "tail")) sn.tail else 0,
+                 .reserve_before_pass = if (@hasField(@TypeOf(sn), "reserve_before_pass")) sn.reserve_before_pass else true,
++                .branch_anchors = if (@hasField(@TypeOf(sn), "branch_anchors")) sn.branch_anchors else false,
+             }, want);
+         }
+     };
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -554,9 +554,14 @@
+             if (g.calls) |*c| if (close.len > 0) {
+                 // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas
+                 var out: std.ArrayList(Value) = .empty;
+-                try c.feed(if (g.thinking) content else text, &out);
++                try c.feed(tool_parse.beforeDsml(if (g.thinking) content else text), &out);
+                 for (out.items) |d| try g.emit(sink, d);
+             };
++            if (g.calls) |*c| {
++                var out: std.ArrayList(Value) = .empty;
++                try c.finish(content, &out);
++                for (out.items) |d| try g.emit(sink, d);
++            }
+         }
+         const prefilled = m.prefilled_ns;
+         const total = seconds(finished_ns - submitted);
+--- a/zig/src/server/tool_parse.zig
++++ b/zig/src/server/tool_parse.zig
+@@ -15,7 +15,8 @@
+ pub const wrapCalls = tool_streaming.wrapCalls;
+ 
+ const Error = error{ Invalid, OutOfMemory };
+-const Call = struct { name: []const u8, arguments: Value };
++// Jay Leaton's PR90 recovery contract, adapted to this older inline DSML parser.
++const Call = struct { name: []const u8, arguments: Value, whole: bool = true };
+ const Envelope = struct { start: usize, end: usize, payload: []const u8 };
+ 
+ pub const Parsed = struct { content: []const u8, calls: ?[]Value };
+@@ -145,7 +146,7 @@
+         try residue.appendSlice(a, text[cursor..env.start]);
+         cursor = env.end;
+         if (std.mem.startsWith(u8, env.payload, dsml41_open)) {
+-            try dsml41Calls(a, env.payload[dsml41_open.len .. env.payload.len - dsml41_close.len], &known, max_calls, &calls);
++            try dsml41Calls(a, env.payload[dsml41_open.len .. env.payload.len - dsml41_close.len], &known, max_calls, &calls, &residue);
+             continue;
+         }
+         if (max_calls) |m| if (calls.items.len >= m) continue;
+@@ -172,8 +173,8 @@
+             if ((try callName(a, c, &known)) == null) break false;
+         } else true else false;
+         if (!good) {
+-            // a malformed or unoffered call stays text when calls are unlimited, and drops out of a one-call reply
+-            if (max_calls == null) try residue.appendSlice(a, text[env.start..env.end]);
++            // Rejected envelopes remain visible; a call limit is not a reason to hide the error.
++            try residue.appendSlice(a, text[env.start..env.end]);
+             continue;
+         }
+         for (parsed.?) |c| {
+@@ -195,7 +196,12 @@
+     const tail = try argumentsClose(a, strip(block));
+     const closed = try std.mem.concat(a, u8, &.{ "<tool_call>", block, tail, "</tool_call>" });
+     // the strict reading: one whole call to an offered tool, nothing but its markup
+-    if ((try parse(a, closed, tools, 1)).calls == null) return "";
++    const calls = (try parse(a, closed, tools, 1)).calls orelse return "";
++    const name = calls[0].get("function").?.get("name").?.string;
++    const offered = for (tools) |tool| {
++        if (std.ascii.eqlIgnoreCase(try tool_specs.toolName(a, tool), name)) break true;
++    } else false;
++    if (!offered) return "";
+     return std.mem.concat(a, u8, &.{ tail, "</tool_call>" });
+ }
+ 
+@@ -207,10 +213,17 @@
+     return closed[body.len..];
+ }
+ 
+-/// The offered tool's spelling, or null when the request did not declare that name.
++/// Offered spelling, or a whole valid unknown call for the harness to refuse and recover from.
+ fn callName(a: Allocator, c: Call, known: *const std.StringArrayHashMapUnmanaged([]const u8)) Allocator.Error!?[]const u8 {
+     const name = strip(c.name);
+-    return if (known.get(try std.ascii.allocLowerString(a, name))) |offered| offered else null;
++    if (known.get(try std.ascii.allocLowerString(a, name))) |offered| return offered;
++    return if (c.whole and functionName(name) and c.arguments == .object and tool_params.finite(c.arguments)) name else null;
++}
++
++pub fn functionName(name: []const u8) bool {
++    if (name.len == 0 or name.len > 64) return false;
++    for (name) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-')) return false;
++    return true;
+ }
+ 
+ /// ``_openai_tool_call``: the call under ``name`` (``callName``), arguments as compact JSON.
+@@ -353,14 +366,15 @@
+     } else return null;
+     const body = strip(block[body_start..close]);
+     const params = try parameterBlocks(a, body);
+-    if (complete and !allSpace(params.residue)) return null;
++    const whole = allSpace(params.residue);
++    if (complete and !whole) return null;
+     const arguments = try json.newObject(a);
+     for (params.items) |p| {
+         const key = strip(p.key);
+         const schema: Value = if (schemas) |s| try tool_params.schemaOf(s, name, key, a) else .{ .object = try json.newObject(a) };
+         try arguments.put(a, key, try tool_params.decode(a, p.value, schema, true));
+     }
+-    return .{ .name = name, .arguments = .{ .object = arguments } };
++    return .{ .name = name, .arguments = .{ .object = arguments }, .whole = whole };
+ }
+ 
+ const Param = struct { key: []const u8, value: []const u8 };
+@@ -421,14 +435,15 @@
+         }
+     }
+     try residue.appendSlice(a, rest[kept..]);
+-    if (complete and !allSpace(residue.items)) return null;
++    const whole = allSpace(residue.items);
++    if (complete and !whole) return null;
+     const arguments = try json.newObject(a);
+     for (pairs.items) |p| {
+         const key = strip(p.key);
+         const schema: Value = if (schemas) |s| try tool_params.schemaOf(s, name, key, a) else .{ .object = try json.newObject(a) };
+         try arguments.put(a, key, try tool_params.decode(a, p.value, schema, false));
+     }
+-    return .{ .name = name, .arguments = .{ .object = arguments } };
++    return .{ .name = name, .arguments = .{ .object = arguments }, .whole = whole };
+ }
+ 
+ /// Gemma 4's ``call:NAME{key:value,...}`` (or bare ``:NAME{...}``): strings between ``<|"|>``, keys bare.
+@@ -486,8 +501,13 @@
+     return .{ .name = name, .arguments = try jsonObject(a, .{ .string = text }) };
+ }
+ 
+-/// Each invoke of a DeepSeek-V4.1 calls block as a call; with a limit, only offered tools with finite arguments, up to it.
+-fn dsml41Calls(a: Allocator, block: []const u8, known: *const std.StringArrayHashMapUnmanaged([]const u8), max_calls: ?usize, calls: *std.ArrayList(Value)) Allocator.Error!void {
++/// Preserve offered-call decoding; unknown calls require intact markup and finite object arguments.
++fn dsml41Calls(a: Allocator, block: []const u8, known: *const std.StringArrayHashMapUnmanaged([]const u8), max_calls: ?usize, calls: *std.ArrayList(Value), residue: *std.ArrayList(u8)) Allocator.Error!void {
++    const Item = struct { call: Call, raw: []const u8 };
++    var items: std.ArrayList(Item) = .empty;
++    var unparsed: std.ArrayList(u8) = .empty;
++    var outer_whole = true;
++    var kept: usize = 0;
+     var pos: usize = 0;
+     while (find(block, invoke41_open, pos)) |s| {
+         pos = s + 1;
+@@ -496,9 +516,14 @@
+         if (q == name_start or !std.mem.startsWith(u8, block[q..], "\">")) continue;
+         const e = find(block, invoke41_close, q + 2) orelse continue;
+         pos = e + invoke41_close.len;
++        outer_whole = outer_whole and allSpace(block[kept..s]);
++        if (!allSpace(block[kept..s])) try unparsed.appendSlice(a, block[kept..s]);
++        kept = pos;
+         const name = strip(block[name_start..q]);
+         const body = block[q + 2 .. e];
+         const arguments = try json.newObject(a);
++        var whole = true;
++        var param_kept: usize = 0;
+         var p: usize = 0;
+         while (find(body, param41_open, p)) |ps| {
+             p = ps + 1;
+@@ -517,17 +542,41 @@
+             v_start += 1;
+             const pe = find(body, param41_close, v_start) orelse continue;
+             p = pe + param41_close.len;
++            whole = whole and allSpace(body[param_kept..ps]);
++            param_kept = p;
+             const value = body[v_start..pe];
+             const v: Value = if (json_value) switch (try json.parseText(a, value)) {
+                 .ok => |parsed| parsed,
+-                .err => .{ .string = value },
++                .err => blk: {
++                    whole = false;
++                    break :blk .{ .string = value };
++                },
+             } else .{ .string = value };
+             try arguments.put(a, body[ns..nq], v);
+         }
+-        if (name.len == 0) continue;
++        whole = whole and allSpace(body[param_kept..]);
++        try items.append(a, .{ .call = .{ .name = name, .arguments = .{ .object = arguments }, .whole = whole }, .raw = block[s..pos] });
++    }
++    outer_whole = outer_whole and allSpace(block[kept..]);
++    if (!allSpace(block[kept..])) try unparsed.appendSlice(a, block[kept..]);
++    const initial_count = calls.items.len;
++    var rejected = unparsed;
++    for (items.items) |item| {
++        var c = item.call;
++        const name = c.name;
++        c.whole = c.whole and outer_whole;
+         const offered = known.get(try std.ascii.allocLowerString(a, name));
+-        if (max_calls) |m| if (calls.items.len >= m or offered == null or !tool_params.finite(.{ .object = arguments })) continue;
+-        try calls.append(a, try openaiCall(a, offered orelse name, .{ .object = arguments }));
++        if (offered == null and (try callName(a, c, known)) == null) {
++            try rejected.appendSlice(a, item.raw);
++            continue;
++        }
++        if (max_calls) |m| if (calls.items.len >= m or !tool_params.finite(c.arguments)) continue;
++        if (name.len > 0) try calls.append(a, try openaiCall(a, offered orelse name, c.arguments));
++    }
++    if (rejected.items.len > 0) {
++        try residue.appendSlice(a, dsml41_open);
++        try residue.appendSlice(a, if (calls.items.len == initial_count) block else rejected.items);
++        try residue.appendSlice(a, dsml41_close);
+     }
+ }
+ 
+--- a/zig/src/server/tool_parse_test.zig
++++ b/zig/src/server/tool_parse_test.zig
+@@ -86,13 +86,13 @@
+     for (replies) |text| try std.testing.expectEqualStrings("", try closeCall(a, text, tools));
+ }
+ 
+-test "a call to a tool the request did not declare stays text" {
++test "an invalid unknown call stays text and an intact valid name reaches the harness" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+     defer arena.deinit();
+     const a = arena.allocator();
+     const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
+     const whole = [_][]const u8{
+-        "<tool_call><function=launch><parameter=when>now</parameter></function></tool_call>",
++        "<tool_call><function=tools.launch><parameter=when>now</parameter></function></tool_call>",
+         "<tool_call>{\"name\": \"launch rocket!\", \"arguments\": {\"when\": \"now\"}}</tool_call>",
+         "<tool_call>{\"name\": \"launch\", \"arguments\": {\"when\": NaN}}</tool_call>",
+     };
+@@ -102,7 +102,7 @@
+         try std.testing.expectEqualStrings(text, parallel.content);
+         const single = try parse(a, text, tools, 1);
+         try std.testing.expect(single.calls == null);
+-        try std.testing.expectEqualStrings("", single.content);
++        try std.testing.expectEqualStrings(text, single.content);
+     }
+     // an unclosed envelope is not a call in either mode, so the reply keeps it
+     const open = "<tool_call>{\"name\":\"launch\",\"arguments\":{\"when\":\"now\"}";
+@@ -112,7 +112,7 @@
+         try std.testing.expectEqualStrings(open, k.content);
+     }
+     const prose = "Launching. <tool_call><function=launch><parameter=when>now</function></tool_call>";
+-    try std.testing.expectEqualStrings("Launching.", (try parse(a, prose, tools, 1)).content);
++    try std.testing.expectEqualStrings(prose, (try parse(a, prose, tools, 1)).content);
+     // an offered tool keeps its offered spelling; bare JSON naming one not offered stays content
+     const offered = try parse(a, "<tool_call>{\"name\":\"LOOKUP\"}</tool_call>", tools, null);
+     try std.testing.expectEqualStrings("lookup", offered.calls.?[0].get("function").?.get("name").?.string);
+@@ -140,7 +140,7 @@
+     // JSON that does not parse is the string; no string attribute is a string
+     const loose = "<" ++ D ++ " calls><" ++ D ++ " invoke name=\"weather\"><" ++ D ++ " parameter name=\"x\" string=\"false\">not json</" ++ D ++ " parameter><" ++ D ++ " parameter name=\"y\">7</" ++ D ++ " parameter></" ++ D ++ " invoke></" ++ D ++ " calls>";
+     try std.testing.expectEqualStrings("{\"x\":\"not json\",\"y\":\"7\"}", (try parse(a, loose, tools, null)).calls.?[0].get("function").?.get("arguments").?.string);
+-    // a tool the request did not offer is a call under the model's name, for the client to answer; one call a reply drops it
++    // A valid unknown name is a call for the client to refuse, also in single-call mode.
+     const other = "<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"launch\">\n<" ++ D ++ " parameter name=\"when\" string=\"true\">now</" ++ D ++ " parameter>\n</" ++ D ++ " invoke>\n</" ++ D ++ " calls>";
+     const kept = try parse(a, other, tools, null);
+     try std.testing.expectEqualStrings("", kept.content);
+@@ -149,7 +149,7 @@
+     try std.testing.expectEqualStrings("{\"when\":\"now\"}", kept.calls.?[0].get("function").?.get("arguments").?.string);
+     const one = try parse(a, other, tools, 1);
+     try std.testing.expectEqualStrings("", one.content);
+-    try std.testing.expect(one.calls == null);
++    try std.testing.expectEqualStrings("launch", one.calls.?[0].get("function").?.get("name").?.string);
+     // a block with no invoke goes; an unclosed block stays text
+     try std.testing.expectEqualStrings("Hi.", (try parse(a, "Hi.<" ++ D ++ " calls>\n</" ++ D ++ " calls>", tools, null)).content);
+     const open = "Hi.<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"weather\">";
+--- a/zig/src/server/tool_stream.zig
++++ b/zig/src/server/tool_stream.zig
+@@ -36,13 +36,17 @@
+ pub const Streamer = struct {
+     a: Allocator,
+     schemas: tool_params.Schemas,
++    tools: []const Value,
+     known: std.StringHashMapUnmanaged([]const u8) = .empty,
+     current: []const u8 = "",
+     value_schema: Value = .null,
+     typed: bool = false,
+     buffer: std.ArrayList(u8) = .empty,
+     pos: usize = 0,
+-    state: enum { outside, call, function, value, closing, abort } = .outside,
++    state: enum { outside, call, deferred, function, value, closing, abort } = .outside,
++    envelope_start: usize = 0,
++    deferred_searched: usize = 0,
++    sent_names: std.ArrayList([]const u8) = .empty,
+     index: i64 = -1,
+     args_open: bool = false,
+     lead: bool = false,
+@@ -51,7 +55,7 @@
+     searched: usize = 0, // the answer is only ever extended, so prose already searched holds no opener
+ 
+     pub fn init(a: Allocator, tools: []const Value) Allocator.Error!Streamer {
+-        var s: Streamer = .{ .a = a, .schemas = try tool_params.schemas(a, tools) };
++        var s: Streamer = .{ .a = a, .schemas = try tool_params.schemas(a, tools), .tools = tools };
+         for (tools) |tool| {
+             if (tool != .object) continue;
+             const spec = if (tool.get("function")) |f| (if (f == .object) f else tool) else tool;
+@@ -88,7 +92,16 @@
+                         s.searched = text.len;
+                         return;
+                     };
++                    // A supported but nonstreamed envelope before this XML call
++                    // must retain source order. Defer the remaining calls to the
++                    // whole parser instead of streaming a later same-name call.
++                    const gap = text[@min(s.pos, j)..j];
++                    if (unstreamedEnvelope(gap)) {
++                        s.state = .abort;
++                        return;
++                    }
+                     s.pos = j + "<tool_call>".len;
++                    s.envelope_start = j;
+                     s.state = .call;
+                 },
+                 .call => {
+@@ -99,12 +112,19 @@
+                     };
+                     const lower = try std.ascii.allocLowerString(s.a, reply_text.pyStrip(m.name));
+                     const name = s.known.get(lower) orelse {
+-                        s.state = .abort;
+-                        return;
++                        if (!tool_parse.functionName(reply_text.pyStrip(m.name))) {
++                            s.state = .abort;
++                            return;
++                        }
++                        // Do not emit an unknown name or any argument until the whole call validates.
++                        s.state = .deferred;
++                        s.deferred_searched = s.pos;
++                        continue;
+                     };
+                     s.current = name;
+                     s.index += 1;
+                     s.streamed = true;
++                    try s.sent_names.append(s.a, name);
+                     const function = try json.newObject(s.a);
+                     try function.put(s.a, "name", .{ .string = name });
+                     try function.put(s.a, "arguments", .{ .string = "" });
+@@ -117,6 +137,18 @@
+                     s.args_open = false;
+                     s.pos += m.len;
+                     s.state = .function;
++                },
++                .deferred => {
++                    const from = @min(text.len, @max(s.pos, s.deferred_searched -| ("</tool_call>".len - 1)));
++                    const end = reply_text.findTag(text, from, "</tool_call>") orelse {
++                        s.deferred_searched = text.len;
++                        return;
++                    };
++                    const after = end + "</tool_call>".len;
++                    const parsed = try tool_parse.parse(s.a, text[s.envelope_start..after], s.tools, null);
++                    if (parsed.calls) |calls| try s.finishedCalls(calls, out);
++                    s.pos = after;
++                    s.state = .outside;
+                 },
+                 .function => {
+                     if (opening(rest, "<parameter=")) |m| {
+@@ -178,6 +210,31 @@
+                 .abort => return,
+             }
+         }
++    }
++
++    fn finishedCalls(s: *Streamer, calls: []const Value, out: *std.ArrayList(Value)) Allocator.Error!void {
++        for (calls) |call| {
++            s.index += 1;
++            s.streamed = true;
++            try s.sent_names.append(s.a, call.get("function").?.get("name").?.string);
++            const deltas = try tool_parse.deltas(s.a, &.{call});
++            for (deltas) |delta| {
++                for (delta.get("tool_calls").?.array) |one| try one.object.put(s.a, "index", try json.intValue(s.a, s.index));
++                try out.append(s.a, delta);
++            }
++        }
++    }
++
++    /// An earlier XML call must not suppress a later DSML/JSON call at HTTP finalization.
++    /// If nothing streamed, leave the existing whole-reply fallback and single-call policy in charge.
++    pub fn finish(s: *Streamer, text: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
++        if (!s.streamed) return;
++        const calls = (try tool_parse.parse(s.a, text, s.tools, null)).calls orelse return;
++        if (calls.len < s.sent_names.items.len) return;
++        for (s.sent_names.items, calls[0..s.sent_names.items.len]) |name, call| {
++            if (!std.mem.eql(u8, name, call.get("function").?.get("name").?.string)) return;
++        }
++        try s.finishedCalls(calls[s.sent_names.items.len..], out);
+     }
+ };
+ 
+@@ -275,6 +332,20 @@
+     return nameLike(name[0..colon]) and std.ascii.eqlIgnoreCase(name[colon + 1 ..], "tool_call");
+ }
+ 
++/// An earlier supported opener owns its arguments even before its closer arrives.
++/// Do not stream a later literal XML opener from inside such an envelope.
++fn unstreamedEnvelope(text: []const u8) bool {
++    if (tool_parse.beforeDsml(text).len < text.len) return true;
++    var pos: usize = 0;
++    while (std.mem.indexOfScalarPos(u8, text, pos, '<')) |start| {
++        const end = std.mem.indexOfScalarPos(u8, text, start, '>') orelse return false;
++        const name = text[start + 1 .. end];
++        if (callTag(name) or std.mem.eql(u8, name, "|tool_call")) return true;
++        pos = start + 1; // prose may contain '<' before a real opener's '<'
++    }
++    return false;
++}
++
+ /// ``parallel_tool_calls: false`` keeps one call and hides call markup from streamed prose.
+ pub const Policy = struct {
+     single: bool = false,
+@@ -363,7 +434,7 @@
+     try std.testing.expect((try tool_params.closedJson(a, sent)) == null);
+ }
+ 
+-test "a one-call reply drops an unoffered call and still hides an unclosed one" {
++test "a one-call reply retains malformed unknown markup and still hides an unclosed one" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+     defer arena.deinit();
+     const a = arena.allocator();
+@@ -373,8 +444,8 @@
+     // what attachCalls makes of the reply: the parse, then the policy's content
+     const r = try tool_parse.parse(a, text, tools, single.maxCalls());
+     try std.testing.expect(r.calls == null);
+-    try std.testing.expectEqualStrings("Launching.", r.content);
+-    try std.testing.expectEqualStrings("Launching.", try single.parsedContent(a, r.content));
++    try std.testing.expectEqualStrings(text, r.content);
++    try std.testing.expectEqualStrings(text, try single.parsedContent(a, r.content));
+     try std.testing.expectEqualStrings("Launching. ", try single.parsedContent(a, "Launching. <tool_call>{\"name\""));
+     // a stream that sent the prose before the block ends with the block
+     try std.testing.expectEqualStrings(text["Launching. ".len..], single.kept(text, "\nLaunching. ").?);
