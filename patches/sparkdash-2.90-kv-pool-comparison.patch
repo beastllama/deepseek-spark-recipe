@@ -1,0 +1,527 @@
+--- a/server/index.js
++++ b/server/index.js
+@@ -1,4 +1,4 @@
+-import { validateCachedTail, validateAdmissionCapacity } from './collectors/CachedTailBench.js';
++import { validateCachedTail, validateAdmissionCapacity, admissionProfile } from './collectors/CachedTailBench.js';
+ // First on purpose: imports are evaluated in order, and config.js, settings.js
+ // and the bench modules read process.env while they load.
+ import "dotenv/config";
+@@ -1582,11 +1582,11 @@
+     return res.status(err.status || 400).json({ error: err.message });
+   }
+   const port = target.port;
+-  const concurrencies = cachedTail ? [cachedTail === "admission" ? 4 : cachedTail === "pause" || cachedTail === "pause-candidate" ? 8 : 1] : hotShortCache ? [1] : mixedCache ? [3] : normalizeConcurrencies(req.body?.concurrencies);
+-  const admissionScenario = cachedTail === "admission";
++  const concurrencies = cachedTail ? [cachedTail === "admission-pool" ? 5 : cachedTail === "admission" ? 4 : cachedTail === "pause" || cachedTail === "pause-candidate" ? 8 : 1] : hotShortCache ? [1] : mixedCache ? [3] : normalizeConcurrencies(req.body?.concurrencies);
++  const admissionScenario = admissionProfile(cachedTail);
+   const effectiveMaxTokens = admissionScenario ? 32768 : req.body?.maxTokens ?? 400;
+   try {
+-    validateDecodeBudget(admissionScenario ? [5] : hotShortCache ? [HOT_SHORT_CACHE_REQUESTS] : concurrencies, effectiveMaxTokens);
++    validateDecodeBudget(admissionScenario ? [admissionScenario.waveRequests + 1] : hotShortCache ? [HOT_SHORT_CACHE_REQUESTS] : concurrencies, effectiveMaxTokens);
+   } catch (err) {
+     return res.status(err.status || 429).json({ error: err.message });
+   }
+@@ -1616,7 +1616,7 @@
+   if ((mixedCache || hotShortCache || cachedTail) && (target.custom || !monitor || backend !== "tensorfold")) {
+     return res.status(400).json({ error: hotShortCache ? "Hot-short cache retention requires a monitored local TensorFold model" : "Mixed cache requires a monitored local TensorFold model" });
+   }
+-  const contextTokens = admissionScenario ? 126000 : cachedTail ? 24576 : hotShortCache ? HOT_SHORT_CACHE_CONTEXT : mixedCache ? MIXED_CACHE_CONTEXT : parseContextSize(req.body?.contextTokens) || 0;
++  const contextTokens = admissionScenario ? admissionScenario.contextEstimate : cachedTail ? 24576 : hotShortCache ? HOT_SHORT_CACHE_CONTEXT : mixedCache ? MIXED_CACHE_CONTEXT : parseContextSize(req.body?.contextTokens) || 0;
+   if (contextTokens > 0 && !target.custom && monitor && backend === "tensorfold") {
+     // Admission needs a fresh observation of this port, not a retained display snapshot.
+     const pool = await monitor.llmProbes?.get(port)?.getSharedPoolCapacity?.();
+@@ -1632,10 +1632,10 @@
+         throw err;
+       }
+       if (cachedTail && (sharedPoolTokens < 262144 || contextLength < 147456)) throw new Error("Cached-tail scenario requires at least 262144 shared KV tokens and 147456 context");
+-      validateDecodeContextBudget(admissionScenario ? [5] : hotShortCache ? [HOT_SHORT_CACHE_REQUESTS] : concurrencies, contextTokens);
+-      if (admissionScenario) validateAdmissionCapacity(sharedPoolTokens, contextLength);
+-      // Admission measures four queued requests, not four simultaneously resident
+-      // streams. Still enforce full per-request fit and the fixed work budget.
++      validateDecodeContextBudget(admissionScenario ? [admissionScenario.waveRequests + 1] : hotShortCache ? [HOT_SHORT_CACHE_REQUESTS] : concurrencies, contextTokens);
++      if (admissionScenario) validateAdmissionCapacity(sharedPoolTokens, contextLength, cachedTail);
++      // Admission measures queued requests and does not require all wave reservations to be
++      // resident together. Enforce full per-request fit and the fixed work budget.
+       validateDecodePoolBudget(admissionScenario ? [1] : concurrencies, contextTokens,
+         effectiveMaxTokens, sharedPoolTokens);
+     } catch (err) {
+@@ -1663,6 +1663,7 @@
+       mixedCacheArrival,
+       hotShortCache,
+       cachedTail,
++      ...(cachedTail === 'admission-pool' ? { admissionPoolTokens: sharedPoolTokens } : {}),
+       maxTokens: req.body?.maxTokens,
+       promptType: req.body?.promptType,
+       temperature: req.body?.temperature,
+--- a/server/collectors/CachedTailBench.js
++++ b/server/collectors/CachedTailBench.js
+@@ -1,6 +1,30 @@
+ import { createHash } from 'node:crypto';
+ import { runStreamingRequest, sleep } from './LlmStreaming.js';
+ import { streamPauseMeter, p95LongestPause } from './streamPause.js';
++
++const ADMISSION_TAILS = [1024, 2048, 4096, 8192];
++const BASELINE_POOL = 655360, LARGER_POOL = 786432;
++const ADMISSION_OUTPUT_TOKENS = 32768;
++
++export function admissionProfile(mode) {
++  if (mode === 'admission-pool') return { waveRequests: 5, contextEstimate: 144000, protocol: 'admission-pool-v1' };
++  if (mode === 'admission') return { waveRequests: 4, contextEstimate: 126000, protocol: 'admission-natural-eos-v1' };
++  return null;
++}
++
++function reservedPositions(promptTokens) {
++  // This selected engine uses 64 draft rows and two guard rows before alignment.
++  return Math.ceil((promptTokens + ADMISSION_OUTPUT_TOKENS + 64 + 2) / 2048) * 2048;
++}
++
++function admissionPoolGeometry(longs, short) {
++  const longReservations = longs.map(r => reservedPositions(r.reportedPromptTokens));
++  const longReservedTokens = longReservations.reduce((sum, n) => sum + n, 0);
++  const shortReservedTokens = reservedPositions(short.reportedPromptTokens);
++  const totalReservedTokens = longReservedTokens + shortReservedTokens;
++  const threeLongAndShort = longReservedTokens - Math.min(...longReservations) + shortReservedTokens;
++  return { longReservations, longReservedTokens, shortReservedTokens, totalReservedTokens, threeLongAndShort };
++}
+ 
+ const WORDS = 'harbor ledger copper window marble signal orchard violet engine paper silver lantern meadow anchor cobalt thistle granite ribbon falcon ember quartz willow saddle beacon canyon velvet timber russet nickel fennel garnet pillow summit drizzle walnut cinder trellis pebble mantle saffron'.split(' ');
+ 
+@@ -32,7 +56,7 @@
+ 
+ export function validateCachedTail(mode, mixed = false, hot = false) {
+   if (mode == null || mode === '') return null;
+-  if (!['replay', 'replay-candidate', 'pause', 'pause-candidate', 'branch', 'branch-resume', 'admission'].includes(mode) || mixed || hot) {
++  if (!['replay', 'replay-candidate', 'pause', 'pause-candidate', 'branch', 'branch-resume', 'admission', 'admission-pool'].includes(mode) || mixed || hot) {
+     const err = new Error('Choose cached-tail replay or pause alone'); err.status = 400; throw err;
+   }
+   return mode;
+@@ -66,7 +90,12 @@
+ 
+ // This scenario measures queuing; unlike a decode wave it does not require all
+ // four reservations to fit at once. Each full request must fit independently.
+-export function validateAdmissionCapacity(poolTokens, contextTokens) {
++export function validateAdmissionCapacity(poolTokens, contextTokens, mode) {
++  if (mode === 'admission-pool' &&
++      (![BASELINE_POOL, LARGER_POOL].includes(poolTokens) || contextTokens !== 524288)) {
++    const err = new Error('Pool comparison requires a fresh 524288 context and a 655360 or 786432 shared KV pool');
++    err.status = 400; throw err;
++  }
+   if (!Number.isSafeInteger(poolTokens) || poolTokens < 524288 ||
+       !Number.isSafeInteger(contextTokens) || contextTokens < 163840) {
+     const err = new Error('Admission measurement requires fresh capacity: 524288 shared KV tokens and at least 163840 context');
+@@ -75,6 +104,8 @@
+ }
+ 
+ export async function runCachedTailScenario({ baseUrl, modelId, mode, salt, abortSignal, apiKey, onStep, branchPrior = null }) {
++  const admission = admissionProfile(mode);
++  const comparePools = mode === 'admission-pool';
+   const controller = new AbortController();
+   const abort = () => controller.abort();
+   if (abortSignal?.aborted) abort();
+@@ -99,7 +130,7 @@
+     if (!traffic) return;
+     if (outsideTraffic(traffic.start, g, traffic.submitted)) traffic.discarded = true;
+     traffic.last = g;
+-    if (mode === 'admission') {
++    if (admission) {
+       traffic.maxRunning = Math.max(traffic.maxRunning ?? 0, g.running);
+       traffic.maxWaiting = Math.max(traffic.maxWaiting ?? 0, g.waiting);
+       if (traffic.discarded) abort(); // Cancel only this benchmark's requests.
+@@ -113,10 +144,10 @@
+     const row = samples.find(s => s.sample === traffic.sample) ?? { sample: traffic.sample };
+     if (!samples.includes(row)) samples.push(row);
+     row.traffic = { start: traffic.start, end: g, submitted: traffic.submitted, discarded: traffic.discarded,
+-      ...(mode === 'admission' ? { maxRunning: traffic.maxRunning ?? 0, maxWaiting: traffic.maxWaiting ?? 0, samplingMs: 250 } : {}) };
++      ...(admission ? { maxRunning: traffic.maxRunning ?? 0, maxWaiting: traffic.maxWaiting ?? 0, samplingMs: 250 } : {}) };
+     if (traffic.discarded) {
+       row.reproduced = false; row.overlapVerified = false; row.discarded = true;
+-      if (mode.endsWith('-candidate') || mode === 'admission') row.comparisonValid = false;
++      if (mode.endsWith('-candidate') || admission) row.comparisonValid = false;
+       for (const s of streams.filter(s => s.sample === traffic.sample)) s.discarded = true;
+       traffic = null; throw new Error('Sample discarded: outside traffic, counter reset, disconnect or unverified request accounting');
+     }
+@@ -128,7 +159,7 @@
+     const pause = streamPauseMeter();
+     const state = { first: null, last: null, done: false, result: null };
+     const body = { model: modelId, messages: [{ role: 'user', content }], max_tokens: maxTokens, temperature: 0, stream: true, stream_options: { include_usage: true } };
+-    if (mode === 'admission') Object.assign(body, { temperature: 0.7, top_p: 1, top_k: 20, reasoning_effort: 'high' });
++    if (admission) Object.assign(body, { temperature: 0.7, top_p: 1, top_k: 20, reasoning_effort: 'high' });
+     else if (maxTokens > 8) Object.assign(body, { min_tokens: maxTokens, ignore_eos: true, stop: [] });
+     const requestStartedAt = Date.now();
+     const promise = (async () => {
+@@ -143,7 +174,7 @@
+         reportedPromptTokens: r.usage?.promptTokens ?? null, tokenSha: r.tensorfold?.tokenSha ?? null, nativeTtftSeconds: r.tensorfold?.ttftSeconds ?? null, nativePrefillSeconds: r.tensorfold?.prefillSeconds ?? null, cachedTokens: r.cachedPromptTokensReported ? r.cachedPromptTokens : null,
+         prefillTps: r.prefillTps, error: r.error ? 'Request failed' : (r.completionTokens > 0 ? null : 'No generated tokens'),
+         ...pause.result(), promptSha256: createHash('sha256').update(content).digest('hex'),
+-        ...(mode === 'admission' ? {
++        ...(admission ? {
+           maxOutputTokens: maxTokens, finishReason: r.finishReason ?? null,
+           ttftContentMs: r.ttftContentMs ?? null,
+           probeStartedAt: requestStartedAt, probeFinishedAt: Date.now(),
+@@ -161,7 +192,7 @@
+   }
+   try {
+     const prior = branchPrior?.samples ?? [];
+-    const cells = mode === 'admission' ? [1] : mode.startsWith('branch') ? [1024, 2048, 4096, 8192, 12288, 200].filter(n => !prior.some(s => s.targetExtensionTokens === n)) : [1, 2, 3];
++    const cells = admission ? [1] : mode.startsWith('branch') ? [1024, 2048, 4096, 8192, 12288, 200].filter(n => !prior.some(s => s.targetExtensionTokens === n)) : [1, 2, 3];
+     const initialCells = cells.length;
+     for (let sample = 1; sample <= cells.length; sample++) {
+       const startCounts = await idle();
+@@ -173,43 +204,81 @@
+             await sleep(250, watchStop.signal);
+             const g = await gauge(); checkTraffic(g);
+           }
+-        } catch { if (!watchStop.signal.aborted && traffic) { traffic.discarded = true; if (mode === 'admission') abort(); } }
++        } catch { if (!watchStop.signal.aborted && traffic) { traffic.discarded = true; if (admission) abort(); } }
+       })();
+       const s = seed + sample * 100;
+-      if (mode === 'admission') {
+-        const prefix = 'The following reference is synthetic context. Ignore its word order. Follow the task after END REFERENCE.\n' + replayFiller(s, 86000);
+-        stage = 'Prime one fresh approximately 115K prefix'; onStep?.(stage);
++      if (admission) {
++        const reference = 'The following reference is synthetic context. Ignore its word order. Follow the task after END REFERENCE.\n';
++        // A fresh run marker isolates cache state. The synthetic document is identical across variants.
++        const prefix = comparePools
++          ? reference + 'Fixture run ' + String(s).padStart(9, '0') + '.\n' + replayFiller(417362, 100000)
++          : reference + replayFiller(s, 86000);
++        stage = comparePools ? 'Prime one fresh approximately 133K prefix' : 'Prime one fresh approximately 115K prefix';
++        onStep?.(stage);
+         const prime = await ask('Admission prime', prefix, sample).promise;
+         if (traffic.discarded) throw new Error('Sample discarded: outside traffic or unverified live request counts during primer');
+         if (prime.error || prime.cachedTokens !== 0 || !Number.isInteger(prime.reportedPromptTokens) ||
+-            prime.reportedPromptTokens < 110000 || prime.reportedPromptTokens > 118000) {
++            prime.reportedPromptTokens < (comparePools ? 131000 : 110000) || prime.reportedPromptTokens > (comparePools ? 135000 : 118000)) {
+           throw new Error('Admission prefix geometry or cold cache accounting is invalid');
+         }
+         checkTraffic(await idle());
+         if (traffic.discarded) throw new Error('Outside traffic before admission wave');
+-        stage = 'Four requests: 32K output allowance, High, natural completion'; onStep?.(stage);
++        stage = comparePools
++          ? 'Four warm requests, then one short request after all four are outstanding'
++          : 'Four requests: 32K output allowance, High, natural completion';
++        onStep?.(stage);
+         const waveStart = performance.now();
+-        const tails = [1024, 2048, 4096, 8192];
+-        const wave = await Promise.all(tails.map((tail, i) => ask(`Admission tail ${tail}`,
++        const requests = ADMISSION_TAILS.map((tail, i) => ask(`Admission tail ${tail}`,
+           prefix + `\nContinuation ${i + 1}.` + ' harbor'.repeat(tail) +
+-          '\nEND REFERENCE. Give exactly 12 concise numbered checks for a safe database backup and restore. Explain the purpose of each in one sentence. Stop after check 12.', sample, 32768).promise));
++          '\nEND REFERENCE. Give exactly 12 concise numbered checks for a safe database backup and restore. Explain the purpose of each in one sentence. Stop after check 12.', sample, ADMISSION_OUTPUT_TOKENS));
++        let shortArrival = null;
++        if (comparePools) {
++          // Use a server observation of request order, rather than racing HTTP connections.
++          const until = performance.now() + 8000;
++          for (;;) {
++            const counts = await gauge();
++            checkTraffic(counts);
++            if (traffic.discarded || counts.completed - traffic.start.completed !== 1 ||
++                requests.some(r => r.done) || performance.now() > until) {
++              throw new Error('Could not verify all four warm requests outstanding before the short request');
++            }
++            if (counts.running + counts.waiting === ADMISSION_TAILS.length) {
++              shortArrival = { elapsedMs: performance.now() - waveStart, running: counts.running, waiting: counts.waiting };
++              break;
++            }
++            await sleep(100, signal);
++          }
++          requests.push(ask('Short backup triage',
++            'A database backup has just arrived for an urgent restore. Give five concise checks for deciding whether it is safe to restore, and explain each in one sentence.',
++            sample, ADMISSION_OUTPUT_TOKENS));
++        }
++        const wave = await Promise.all(requests.map(r => r.promise));
+         const waveDurationMs = performance.now() - waveStart;
+         // Repeated space-prefixed words are one token each for this fixture.
+         // Allow 256 tokens for chat framing/instructions, and at most one
+         // 2048-row placement block of prefix rounding. Report actual values.
+-        const valid = wave.every((r,i) => !r.error && r.finishReason === 'stop' &&
+-          Number.isFinite(r.ttftContentMs) && r.ttftContentMs >= 0 &&
+-          Number.isInteger(r.reportedPromptTokens) && r.reportedPromptTokens >= 110000 && r.reportedPromptTokens <= 126000 &&
+-          r.reportedPromptTokens - prime.reportedPromptTokens >= tails[i] - 256 &&
+-          r.reportedPromptTokens - prime.reportedPromptTokens <= tails[i] + 256 &&
++        const natural = r => !r.error && r.finishReason === 'stop' && Number.isFinite(r.ttftContentMs) &&
++          r.ttftContentMs >= 0 && Number.isInteger(r.reportedPromptTokens);
++        const longReplies = wave.slice(0, ADMISSION_TAILS.length);
++        const validLongs = longReplies.every((r,i) => natural(r) &&
++          r.reportedPromptTokens >= (comparePools ? 131000 : 110000) && r.reportedPromptTokens <= admission.contextEstimate &&
++          Math.abs(r.reportedPromptTokens - prime.reportedPromptTokens - ADMISSION_TAILS[i]) <= 256 &&
+           Number.isInteger(r.cachedTokens) && r.cachedTokens >= prime.reportedPromptTokens - 2048 && r.cachedTokens <= prime.reportedPromptTokens &&
+           Number.isInteger(r.uncachedPromptTokens) && r.uncachedPromptTokens > 0);
++        const short = comparePools ? wave.at(-1) : null;
++        const validShort = short && natural(short) && short.reportedPromptTokens > 0 &&
++          short.reportedPromptTokens < 2048 && short.cachedTokens === 0;
++        const geometry = validLongs && validShort ? admissionPoolGeometry(longReplies, short) : null;
++        const validPoolGeometry = geometry && geometry.longReservedTokens > BASELINE_POOL &&
++          geometry.threeLongAndShort <= BASELINE_POOL && geometry.totalReservedTokens <= LARGER_POOL;
++        const valid = validLongs && (!comparePools || Boolean(validPoolGeometry));
+         samples.push({ sample, comparisonValid: valid, waveDurationMs,
+           completedRequests: wave.filter(r => !r.error && r.finishReason === 'stop').length,
+-          requestsPerMinute: valid ? 4 * 60000 / waveDurationMs : null,
+-          meanCompletionMs: wave.reduce((n,r) => n + r.totalMs, 0) / 4,
+-          meanFirstAnswerMs: valid ? wave.reduce((n,r) => n + r.ttftContentMs, 0) / 4 : null,
+-          p95LongestPauseMs: p95LongestPause(wave) });
++          requestsPerMinute: valid ? wave.length * 60000 / waveDurationMs : null,
++          meanCompletionMs: wave.reduce((n,r) => n + r.totalMs, 0) / wave.length,
++          meanFirstAnswerMs: valid ? wave.reduce((n,r) => n + r.ttftContentMs, 0) / wave.length : null,
++          p95LongestPauseMs: p95LongestPause(wave),
++          ...(comparePools ? { geometry, shortArrival } : {}) });
+         if (!valid) throw new Error('Admission sample lacks natural completion, first answer, or expected native prompt/cache geometry');
+         await finishTraffic();
+         continue;
+@@ -299,7 +368,7 @@
+       }
+     }
+   } catch (e) {
+-    error = mode === 'admission' && traffic?.discarded
++    error = admission && traffic?.discarded
+       ? 'Sample discarded: outside traffic, counter reset, disconnect or unverified live request counts'
+       : e?.message || String(e);
+     if (watchStop) watchStop.abort(); if (watchPromise) await watchPromise; abort();
+@@ -310,7 +379,7 @@
+       const row = samples.find(s => s.sample === traffic.sample) ?? { sample: traffic.sample };
+       if (!samples.includes(row)) samples.push(row);
+       row.discarded = true; row.reproduced = false; row.overlapVerified = false;
+-      if (mode.endsWith('-candidate') || mode === 'admission') row.comparisonValid = false;
++      if (mode.endsWith('-candidate') || admission) row.comparisonValid = false;
+       row.traffic = { start: traffic.start, last: traffic.last, submitted: traffic.submitted, discarded: true };
+       for (const s of streams.filter(s => s.sample === traffic.sample)) s.discarded = true;
+     }
+@@ -326,17 +395,17 @@
+     if (drain?.running !== 0 || drain?.waiting !== 0) error = (error ? error + '; ' : '') + 'Backend idle after scenario is unverified';
+   }
+   return {
+-    concurrency: mode === 'admission' ? 4 : mode === 'pause' || mode === 'pause-candidate' ? 8 : 1, cachedTail: mode, samples, seed, drain, branchPrior,
++    concurrency: admission ? admission.waveRequests : mode === 'pause' || mode === 'pause-candidate' ? 8 : 1, cachedTail: mode, samples, seed, drain, branchPrior,
+     streams, streamsOk: streams.filter(s => !s.error).length, streamsFailed: streams.filter(s => s.error).length,
+     meanDecodeTps: 0, aggregateDecodeTps: 0, meanTtftMs: 0, durationMs: performance.now() - started,
+     totalDecodeTokens: streams.reduce((n,s) => n + s.decodeTokens, 0),
+     totalCompletionTokens: streams.reduce((n,s) => n + s.completionTokens, 0),
+-    ...(mode === 'admission' ? { admissionProtocol: {
+-      version: 1, waveRequests: 4, primerRequests: 1, maxOutputTokens: 32768,
+-      targetTailTokens: [1024, 2048, 4096, 8192], naturalCompletion: true,
++    ...(admission ? { admissionProtocol: {
++      version: comparePools ? 2 : 1, waveRequests: admission.waveRequests, primerRequests: 1, maxOutputTokens: ADMISSION_OUTPUT_TOKENS,
++      targetTailTokens: ADMISSION_TAILS, naturalCompletion: true,
+       temperature: 0.7, topK: 20, reasoningEffort: 'high',
+       limitations: 'Synthetic shared prefix and task, not replayed private work. First answer includes queue, prefill and reasoning. Queue wait requires matching native admission logs. Sampled occupancy can miss brief transitions. No speed verdict; compare separately.',
+     } } : {}),
+-    error, model: modelId, warning: mode === 'admission' ? 'One synthetic four-request admission sample after one cold prime. 32K output allowance, natural completion, High, temperature 0.7. Compare completion and first-answer time; native logs are needed to isolate queue wait. Outside traffic invalidates the sample. No engine settings changed.' : mode === 'pause-candidate' ? 'Candidate pause: three samples, six decoders plus one cold fill and one cached short tail (eight live requests, after a separate prime). Same overlap/cache/traffic validity checks as original pause. SSE event gaps, not per-token latency; compare P95 and tail timings with baseline separately, no speed acceptance verdict. Does not test a third arrival behind a medium tail. No engine settings changed.' : mode === 'replay-candidate' ? 'Candidate replay: three samples with the original request sequence. Cache, cold overlap, traffic accounting and finite timings must be valid. No original timing band or speed acceptance verdict; compare recorded results with the baseline separately. No engine settings changed.' : mode.startsWith('branch') ? 'Sequential branch retention: fresh A primed in every cell, actual extension tokens from native usage; six cells and at most one bisection. No engine settings changed.' : 'SSE event gaps, not per-token latency. Pause overlap: six decoders plus one cold fill and one cached tail, eight requests total. Fixed three samples. Original replay reproduction band: alone 4.4–9.2 s; queued 19.9–41.3 s; cached exactly 124,928. No engine settings changed.',
++    error, model: modelId, warning: comparePools ? 'One cold prime followed by four warm long requests and one short request. Native prompt lengths must distinguish the two pools. Compare native queue waits separately.' : admission ? 'One synthetic four-request admission sample after one cold prime. 32K output allowance, natural completion, High, temperature 0.7. Compare completion and first-answer time; native logs are needed to isolate queue wait. Outside traffic invalidates the sample. No engine settings changed.' : mode === 'pause-candidate' ? 'Candidate pause: three samples, six decoders plus one cold fill and one cached short tail (eight live requests, after a separate prime). Same overlap/cache/traffic validity checks as original pause. SSE event gaps, not per-token latency; compare P95 and tail timings with baseline separately, no speed acceptance verdict. Does not test a third arrival behind a medium tail. No engine settings changed.' : mode === 'replay-candidate' ? 'Candidate replay: three samples with the original request sequence. Cache, cold overlap, traffic accounting and finite timings must be valid. No original timing band or speed acceptance verdict; compare recorded results with the baseline separately. No engine settings changed.' : mode.startsWith('branch') ? 'Sequential branch retention: fresh A primed in every cell, actual extension tokens from native usage; six cells and at most one bisection. No engine settings changed.' : 'SSE event gaps, not per-token latency. Pause overlap: six decoders plus one cold fill and one cached tail, eight requests total. Fixed three samples. Original replay reproduction band: alone 4.4–9.2 s; queued 19.9–41.3 s; cached exactly 124,928. No engine settings changed.',
+   };
+ }
+--- a/server/collectors/DecodeBench.js
++++ b/server/collectors/DecodeBench.js
+@@ -1,5 +1,5 @@
+ import { streamPauseMeter } from './streamPause.js';
+-import { runCachedTailScenario, validateCachedTail } from './CachedTailBench.js';
++import { runCachedTailScenario, validateCachedTail, admissionProfile } from './CachedTailBench.js';
+ /**
+  * DecodeBench — concurrent streaming decode throughput benchmark.
+  *
+@@ -1196,6 +1196,7 @@
+       mixedCacheArrival,
+       hotShortCache: rawHotShortCache,
+       cachedTail: rawCachedTail,
++      admissionPoolTokens,
+       debug = false,
+       sampleHardware = null,
+       apiKey = null,
+@@ -1236,13 +1237,13 @@
+       const err = new Error("Run a successful three-sample candidate replay on this model/port within the last hour first"); err.status = 400; throw err;
+     }
+     const pauseScenario = cachedTail === "pause" || cachedTail === "pause-candidate";
+-    const admissionScenario = cachedTail === "admission";
++    const admissionScenario = admissionProfile(cachedTail);
+     if (hotShortCache && backend !== "tensorfold") {
+       const err = new Error("Hot-short cache retention requires a monitored local TensorFold model");
+       err.status = 400;
+       throw err;
+     }
+-    const concurrencies = cachedTail ? [admissionScenario ? 4 : pauseScenario ? 8 : 1] : hotShortCache ? [1] : normalizeConcurrencies(rawConc);
++    const concurrencies = cachedTail ? [admissionScenario ? admissionScenario.waveRequests : pauseScenario ? 8 : 1] : hotShortCache ? [1] : normalizeConcurrencies(rawConc);
+     if (!concurrencies.length) {
+       const err = new Error("Select at least one concurrency level (1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, or 32)");
+       err.status = 400;
+@@ -1305,6 +1306,7 @@
+         concurrencies,
+         maxTokens: admissionScenario ? 32768 : cachedTail ? (pauseScenario ? 2048 : 8) : maxTokens,
+         ...(cachedTail ? { cachedTail } : {}),
++        ...(cachedTail === 'admission-pool' ? { admissionPoolTokens } : {}),
+         ...(mixedCache ? { mixedCache: true } : {}),
+         ...(hotShortCache ? { hotShortCache: true } : {}),
+         ...(hotShortCache ? { reasoningEffort: "high" } : {}),
+@@ -1313,7 +1315,7 @@
+         temperature: admissionScenario ? 0.7 : cachedTail ? 0 : temperature,
+         ...(cachedTail ? { ...(branchPrior ? { branchPrior } : {}), scenarioProtocol: cachedTail.startsWith("branch") ? "branch-retention-streaming-v1" : "replay3-streaming-v1", probeMaxTokens: 8, decoderMaxTokens: pauseScenario ? 2048 : null, thinkingSource: "unchanged server default High" } : { thinking }),
+         ...(backend === "tensorfold" && !cachedTail ? { topK: 20 } : {}),
+-        ...(admissionScenario ? { scenarioProtocol: "admission-natural-eos-v1", probeMaxTokens: 8, maxTokens: 32768, naturalCompletion: true, reasoningEffort: "high", thinkingSource: "explicit scenario High", topK: 20, thinking: true } : {}),
++        ...(admissionScenario ? { scenarioProtocol: admissionScenario.protocol, probeMaxTokens: 8, maxTokens: 32768, naturalCompletion: true, reasoningEffort: "high", thinkingSource: "explicit scenario High", topK: 20, thinking: true } : {}),
+         ...(contextTokens > 0 ? { contextTokens } : {}),
+         ...(debugOn ? { debug: true } : {}),
+         ...(rawHost
+--- a/src/api/types.ts
++++ b/src/api/types.ts
+@@ -1563,8 +1563,10 @@
+   mixedCache?: boolean;
+   /** Ten sequential requests exercising hot-short/deep-prefix retention. */
+   hotShortCache?: boolean;
+-  cachedTail?: "replay" | "replay-candidate" | "pause" | "pause-candidate" | "branch" | "branch-resume" | "admission";
++  cachedTail?: "replay" | "replay-candidate" | "pause" | "pause-candidate" | "branch" | "branch-resume" | "admission" | "admission-pool";
+   reasoningEffort?: "high";
++  /** Server-observed physical shared KV capacity at pool comparison start. */
++  admissionPoolTokens?: number;
+   /** On-demand remote host (Tailscale HTTPS, etc.). */
+   host?: string;
+   tls?: boolean;
+@@ -1662,9 +1664,9 @@
+   contextTokens?: number;
+   contextPrefillMs?: number;
+   mixedCache?: boolean;
+-  samples?: { targetExtensionTokens?: number; actualExtensionTokens?: number; branchCachedTokens?: number; branchNativeTtftSeconds?: number; sample: number; reproduced?: boolean; comparisonValid?: boolean; overlapVerified?: boolean; p95LongestPauseMs?: number | null; waveDurationMs?: number; completedRequests?: number; requestsPerMinute?: number | null; meanCompletionMs?: number; meanFirstAnswerMs?: number | null; discarded?: boolean }[];
++  samples?: { targetExtensionTokens?: number; actualExtensionTokens?: number; branchCachedTokens?: number; branchNativeTtftSeconds?: number; sample: number; reproduced?: boolean; comparisonValid?: boolean; overlapVerified?: boolean; p95LongestPauseMs?: number | null; waveDurationMs?: number; completedRequests?: number; requestsPerMinute?: number | null; meanCompletionMs?: number; meanFirstAnswerMs?: number | null; geometry?: { longReservations: number[]; longReservedTokens: number; shortReservedTokens: number; totalReservedTokens: number; threeLongAndShort: number } | null; shortArrival?: { elapsedMs: number; running: number; waiting: number } | null; discarded?: boolean }[];
+   hotShortCache?: boolean;
+-  cachedTail?: "replay" | "replay-candidate" | "pause" | "pause-candidate" | "branch" | "branch-resume" | "admission";
++  cachedTail?: "replay" | "replay-candidate" | "pause" | "pause-candidate" | "branch" | "branch-resume" | "admission" | "admission-pool";
+   hotShortRetention?: "matched" | "different" | "unknown";
+   sharedTargetTokens?: number;
+   expectedRequests?: number;
+@@ -1743,7 +1745,7 @@
+   thinking?: boolean;
+   mixedCache?: boolean;
+   hotShortCache?: boolean;
+-  cachedTail?: "replay" | "replay-candidate" | "pause" | "pause-candidate" | "branch" | "branch-resume" | "admission";
++  cachedTail?: "replay" | "replay-candidate" | "pause" | "pause-candidate" | "branch" | "branch-resume" | "admission" | "admission-pool";
+   /** Prefill every stream with this many prompt tokens before the decode wave. 0 or omitted: start empty. */
+   contextTokens?: number;
+   /** On-demand remote LLM host (hostname or URL). Skips this Spark's LAN/SSH path. */
+--- a/src/components/SparkPage/BenchmarkDialog.tsx
++++ b/src/components/SparkPage/BenchmarkDialog.tsx
+@@ -134,8 +134,8 @@
+  */
+ function buildShareText(job: DecodeBenchJob, modelId: string | null): string {
+   const name = modelId || "unknown model";
+-  if (job.config.cachedTail === "admission") return [
+-    `${name} | Admission measurement · ${job.status} · four requests · 32K output allowance · natural completion · High · temperature 0.7`,
++  if (job.config.cachedTail === "admission" || job.config.cachedTail === "admission-pool") return [
++    `${name} | Admission measurement · ${job.status} · ${job.config.cachedTail === "admission-pool" ? "five requests" : "four requests"} · 32K output allowance · natural completion · High · temperature 0.7`,
+     ...job.results.flatMap(r => [r.warning ?? "", ...r.streams.map(s => `${s.probeRole}: first answer ${s.ttftContentMs ?? "unknown"} ms; complete ${s.totalMs} ms; prompt ${s.reportedPromptTokens ?? "unknown"}; uncached ${s.uncachedPromptTokens ?? "unknown"}; output ${s.completionTokens}; finish ${s.finishReason ?? "unknown"}`), ...r.samples?.map(s => JSON.stringify(s)) ?? [], r.error ?? ""]),
+   ].join("\n");
+   if (job.config.cachedTail) return [
+@@ -172,10 +172,11 @@
+ 
+ function ResultRow({ r, max }: { r: DecodeBenchJob["results"][number]; max: number }) {
+   const { t } = useTranslation("benchmarks");
+-  if (r.cachedTail === "admission") return <article className="bench-result-row">
+-    <strong>Admission measurement · four requests · 32K output allowance · natural completion</strong>
+-    {r.samples?.map(s => <p key={s.sample}>Valid: {String(s.comparisonValid === true && !s.discarded)} · completed {s.completedRequests ?? 0}/4 · wave {formatTtft(s.waveDurationMs ?? 0)} · {s.requestsPerMinute?.toFixed(2) ?? "unknown"} requests/min</p>)}
+-    {r.streams.map((s,i) => <p key={i} className="bench-sheet__hint">{s.probeRole} · first answer {s.ttftContentMs == null ? "unknown" : formatTtft(s.ttftContentMs)} · complete {formatTtft(s.totalMs)} · input {s.reportedPromptTokens ?? "unknown"} · uncached {s.uncachedPromptTokens ?? "unknown"} · cached {s.cachedTokens ?? "unknown"} · output {s.completionTokens} · finish {s.finishReason ?? "unknown"} {s.error}</p>)}
++  if (r.cachedTail === "admission" || r.cachedTail === "admission-pool") return <article className="bench-result-row">
++    <strong>{r.cachedTail === "admission-pool" ? "KV pool comparison · five requests" : "Admission measurement · four requests"} · 32K output allowance · natural completion</strong>
++    {r.samples?.map(s => <p key={s.sample}>Valid: {String(s.comparisonValid === true && !s.discarded)} · completed {s.completedRequests ?? 0}/{r.concurrency} · wave {formatTtft(s.waveDurationMs ?? 0)} · {s.requestsPerMinute?.toFixed(2) ?? "unknown"} requests/min</p>)}
++    {r.samples?.filter(s => s.geometry).map(s => <p key={s.sample}>KV positions · four long {s.geometry?.longReservedTokens.toLocaleString()} · all five {s.geometry?.totalReservedTokens.toLocaleString()}</p>)}
++    {r.streams.map((s,i) => <p key={i} className="bench-sheet__hint">{s.probeRole} · first answer {s.ttftContentMs == null ? "unknown" : formatTtft(s.ttftContentMs)} · complete {formatTtft(s.totalMs)} · input {s.reportedPromptTokens ?? "unknown"} · uncached {s.uncachedPromptTokens ?? "unknown"} · cached {s.cachedTokens ?? "unknown"} · output {s.completionTokens}{r.cachedTail === "admission-pool" ? " · longest pause " + (s.maxStreamEventGapMs == null ? "unknown" : formatTtft(s.maxStreamEventGapMs)) : ""} · finish {s.finishReason ?? "unknown"} {s.error}</p>)}
+     <p>{r.error || r.warning}</p>
+   </article>;
+   if (r.cachedTail) return <article className="bench-result-row">
+@@ -301,8 +302,10 @@
+   const [temperatureDraft, setTemperatureDraft] = useState(String(DEFAULT_TEMPERATURE));
+   const [thinking, setThinking] = useState(DEFAULT_THINKING);
+   const [contextDraft, setContextDraft] = useState("");
+-  const [cachedTailRequested, setCachedTail] = useState<"" | "replay" | "replay-candidate" | "pause" | "pause-candidate" | "branch" | "branch-resume" | "admission">("");
++  const [cachedTailRequested, setCachedTail] = useState<"" | "replay" | "replay-candidate" | "pause" | "pause-candidate" | "branch" | "branch-resume" | "admission" | "admission-pool">("");
+   const cachedTail = remoteTarget ? "" : cachedTailRequested;
++  const comparePools = cachedTail === "admission-pool";
++  const admissionScenario = comparePools || cachedTail === "admission";
+   const [mixedCacheRequested, setMixedCache] = useState(false);
+   const mixedCache = mixedCacheRequested && !remoteTarget;
+   const [hotShortCacheRequested, setHotShortCache] = useState(false);
+@@ -537,13 +540,13 @@
+       setError(t("decode.errorConcurrency"));
+       return;
+     }
+-    const maxTokens = cachedTail === "admission" ? 32768 : cachedTail ? 2048 : hotShortCache ? 400 : parseInt(maxTokensDraft.trim(), 10);
+-    if (cachedTail !== "admission" && (!Number.isInteger(maxTokens) || maxTokens < 64 || maxTokens > 2048)) {
++    const maxTokens = admissionScenario ? 32768 : cachedTail ? 2048 : hotShortCache ? 400 : parseInt(maxTokensDraft.trim(), 10);
++    if (!admissionScenario && (!Number.isInteger(maxTokens) || maxTokens < 64 || maxTokens > 2048)) {
+       setError(t("decode.errorMaxTokens"));
+       return;
+     }
+-    const temperature = cachedTail === "admission" ? 0.7 : cachedTail ? 0 : hotShortCache ? 0.7 : Number(temperatureDraft.trim());
+-    if ((cachedTail !== "admission" && temperatureDraft.trim() === "") || !Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
++    const temperature = admissionScenario ? 0.7 : cachedTail ? 0 : hotShortCache ? 0.7 : Number(temperatureDraft.trim());
++    if ((!admissionScenario && temperatureDraft.trim() === "") || !Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
+       setError(t("decode.errorTemperature"));
+       return;
+     }
+@@ -562,14 +565,14 @@
+       const started = await startDecodeBench(sparkId, {
+         port: benchPort,
+         ...(cachedTail ? { cachedTail } : {}),
+-        concurrencies: cachedTail ? [cachedTail === "admission" ? 4 : cachedTail === "pause" || cachedTail === "pause-candidate" ? 8 : 1] : hotShortCache ? [1] : mixedCache ? [3] : selected,
++        concurrencies: cachedTail ? [comparePools ? 5 : admissionScenario ? 4 : cachedTail === "pause" || cachedTail === "pause-candidate" ? 8 : 1] : hotShortCache ? [1] : mixedCache ? [3] : selected,
+         ...(mixedCache ? { mixedCache: true } : {}),
+         ...(hotShortCache ? { hotShortCache: true } : {}),
+         maxTokens,
+         modelId: selectedModel || undefined,
+         promptType,
+         temperature,
+-        thinking: hotShortCache ? true : thinking,
++        thinking: hotShortCache || admissionScenario ? true : thinking,
+         ...(contextTokens > 0 ? { contextTokens } : {}),
+         ...(remoteTarget
+           ? { host: remoteTarget.host, tls: remoteTarget.tls }
+@@ -713,10 +716,10 @@
+                       key={String(on)}
+                       type="button"
+                       role="radio"
+-                      aria-checked={(cachedTail === "admission" ? true : thinking) === on}
+-                      disabled={isRunning || starting || hotShortCache || cachedTail === "admission"}
++                      aria-checked={(admissionScenario ? true : thinking) === on}
++                      disabled={isRunning || starting || hotShortCache || admissionScenario}
+                       onClick={() => setThinking(on)}
+-                      className={`bench-conc-btn${(cachedTail === "admission" ? true : thinking) === on ? " is-on" : ""}`}
++                      className={`bench-conc-btn${(admissionScenario ? true : thinking) === on ? " is-on" : ""}`}
+                     >
+                       {on ? t("decode.withThinking") : t("decode.withoutThinking")}
+                     </button>
+@@ -739,8 +742,8 @@
+                   inputMode="decimal"
+                   className="bench-input"
+                   size={6}
+-                  disabled={isRunning || starting || hotShortCache || cachedTail === "admission"}
+-                  value={cachedTail === "admission" ? "0.7" : temperatureDraft}
++                  disabled={isRunning || starting || hotShortCache || admissionScenario}
++                  value={admissionScenario ? "0.7" : temperatureDraft}
+                   onChange={(e) => {
+                     const raw = e.target.value;
+                     if (raw === "" || /^\d*\.?\d{0,2}$/.test(raw)) setTemperatureDraft(raw);
+@@ -810,7 +813,7 @@
+                   )}
+                   {!remoteTarget && <label className="bench-sheet__hint">Cached-tail measurement
+                     <select aria-label="Cached-tail measurement" value={cachedTail} disabled={isRunning || starting}
+-                      onChange={e => { setCachedTail(e.target.value as "" | "replay" | "replay-candidate" | "pause" | "pause-candidate" | "branch" | "branch-resume" | "admission"); setMixedCache(false); setHotShortCache(false); }}>
++                      onChange={e => { setCachedTail(e.target.value as "" | "replay" | "replay-candidate" | "pause" | "pause-candidate" | "branch" | "branch-resume" | "admission" | "admission-pool"); setMixedCache(false); setHotShortCache(false); }}>
+                       <option value="">Off</option><option value="replay">Original replay · three samples</option>
+                       <option value="replay-candidate">Candidate replay · three samples, compare timings separately</option>
+                       <option value="pause">Original pause · three samples, eight requests</option>
+@@ -818,8 +821,9 @@
+                       <option value="branch">Original branch retention · six cells + one bisection</option>
+                       <option value="branch-resume">Resume unfinished branch cells</option>
+                       <option value="admission">Admission · four requests, 32K allowance, natural completion</option>
++                      <option value="admission-pool">KV pool comparison · five requests, 32K allowance</option>
+                     </select>
+-                    <span>{cachedTail === "admission" ? " One fresh approximately 115K prefix, then four concurrent requests with 1K/2K/4K/8K target tails and a 32K output allowance. Natural completion, High, temperature 0.7. Measures first answer and completion time. Starts idle; outside traffic discards the sample. Server lane settings stay unchanged." : cachedTail === "pause-candidate" ? " Run a successful candidate replay on this model/port within the last hour first. Six decoders + cold fill + cached short tail; compare SSE pauses with baseline separately. Does not test a third arrival behind a medium tail." : cachedTail === "replay-candidate" ? " Candidate replay validates cache and overlap without the original timing band. Compare timings with a separate baseline; a valid sample is not an acceptance verdict." : " Run replay first. Pause uses six decoders + cold fill + cached short tail. Fixed replay sampling; engine unchanged."}</span>
++                    <span>{comparePools ? " One cold approximately 133K prime, then four warm requests and one short request. Uses a 32K output allowance, High reasoning, temperature 0.7, and natural completion. Starts idle and discards samples with outside traffic." : admissionScenario ? " One fresh approximately 115K prefix, then four concurrent requests with 1K/2K/4K/8K target tails and a 32K output allowance. Natural completion, High, temperature 0.7. Measures first answer and completion time. Starts idle; outside traffic discards the sample. Server lane settings stay unchanged." : cachedTail === "pause-candidate" ? " Run a successful candidate replay on this model/port within the last hour first. Six decoders + cold fill + cached short tail; compare SSE pauses with baseline separately. Does not test a third arrival behind a medium tail." : cachedTail === "replay-candidate" ? " Candidate replay validates cache and overlap without the original timing band. Compare timings with a separate baseline; a valid sample is not an acceptance verdict." : " Run replay first. Pause uses six decoders + cold fill + cached short tail. Fixed replay sampling; engine unchanged."}</span>
+                   </label>}
+                   <p className="bench-sheet__hint">
+                     {hotShortCache
+@@ -877,8 +881,8 @@
+                   type="text"
+                   inputMode="numeric"
+                   pattern="[0-9]*"
+-                  disabled={isRunning || starting || hotShortCache || cachedTail === "admission"}
+-                  value={cachedTail === "admission" ? "32768" : maxTokensDraft}
++                  disabled={isRunning || starting || hotShortCache || admissionScenario}
++                  value={admissionScenario ? "32768" : maxTokensDraft}
+                   onChange={(e) => {
+                     const raw = e.target.value;
+                     if (raw === "" || /^\d+$/.test(raw)) setMaxTokensDraft(raw);

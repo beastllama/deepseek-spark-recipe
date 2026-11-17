@@ -1,0 +1,663 @@
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -15,6 +15,7 @@
+ const Reason = api.Reason;
+ const Stats = api.Stats;
+ const SubmitError = api.SubmitError;
++const admission = lanes.stream.admission_observation;
+ 
+ pub const LaneHost = struct {
+     gpa: Allocator,
+@@ -58,6 +59,7 @@
+     parked_fill: ?*Job = null, // original fill while its cached-tail cut-in runs in pieces; no third admission
+     between_err: ?anyerror = null,
+     trace: ?*SpanTrace = null,
++    admission_trace: ?*AdmissionTrace = null,
+ 
+     const SpanKind = enum { admission, fill, nested_decode, decode, emit, emit_gap };
+     const Span = struct {
+@@ -85,8 +87,60 @@
+         }
+     };
+ 
++    const AdmissionTrace = struct {
++        admissions: [1024]AdmissionRow = undefined,
++        admission_len: usize = 0,
++        admission_dropped: u64 = 0,
++        // After the initial sample fills, retain the most recent slow or failed admissions.
++        admission_overflow: [256]AdmissionRow = undefined,
++        admission_overflow_start: usize = 0,
++        admission_overflow_len: usize = 0,
++
++        const priority_wait_ns = 30 * std.time.ns_per_s;
++
++        const AdmissionRow = struct {
++            id: Id,
++            prompt: usize,
++            max_new: u32,
++            cached: u32,
++            reason: Reason,
++            wait: admission.Wait,
++        };
++
++        fn pushAdmission(t: *AdmissionTrace, row: AdmissionRow) void {
++            if (t.admission_len < t.admissions.len) {
++                t.admissions[t.admission_len] = row;
++                t.admission_len += 1;
++                return;
++            }
++            const important = row.wait.queue_ns >= priority_wait_ns or row.wait.context_full > 0 or
++                row.wait.fill_busy > 0 or row.reason == .cancelled or row.reason == .failed;
++            if (!important) {
++                t.admission_dropped +|= 1;
++                return;
++            }
++            const tail = (t.admission_overflow_start + t.admission_overflow_len) % t.admission_overflow.len;
++            t.admission_overflow[tail] = row;
++            if (t.admission_overflow_len < t.admission_overflow.len) {
++                t.admission_overflow_len += 1;
++            } else {
++                t.admission_overflow_start = (t.admission_overflow_start + 1) % t.admission_overflow.len;
++                t.admission_dropped +|= 1;
++            }
++        }
++
++        fn overflowAt(t: *const AdmissionTrace, index: usize) AdmissionRow {
++            return t.admission_overflow[(t.admission_overflow_start + index) % t.admission_overflow.len];
++        }
++    };
++
+     fn traceTime(h: *const LaneHost) ?i96 {
+         if (h.trace == null) return null;
++        return std.Io.Clock.awake.now(h.io).toNanoseconds();
++    }
++
++    fn admissionTime(h: *const LaneHost) ?i96 {
++        if (h.admission_trace == null) return null;
+         return std.Io.Clock.awake.now(h.io).toNanoseconds();
+     }
+ 
+@@ -109,6 +163,35 @@
+         std.debug.print("aiops-span-flush v1 {d} {d}\n", .{ trace.len, trace.dropped });
+         trace.len = 0;
+         trace.dropped = 0;
++    }
++
++    fn flushAdmissions(h: *LaneHost) void {
++        const trace = h.admission_trace orelse return;
++        if (trace.admission_len == 0) return;
++        for (trace.admissions[0..trace.admission_len]) |row| logAdmission(row);
++        for (0..trace.admission_overflow_len) |index| logAdmission(trace.overflowAt(index));
++        std.debug.print("aiops-admission-flush v1 {d} {d}\n", .{
++            trace.admission_len + trace.admission_overflow_len, trace.admission_dropped,
++        });
++        trace.admission_len = 0;
++        trace.admission_dropped = 0;
++        trace.admission_overflow_start = 0;
++        trace.admission_overflow_len = 0;
++    }
++
++    fn logAdmission(row: AdmissionTrace.AdmissionRow) void {
++        const w = row.wait;
++        std.debug.print("aiops-admission v1 {d} {d} {d} {d} {s} {d} {d} {d} {d} {d} {d} {d} {d} {d}\n", .{
++            row.id, row.prompt, row.max_new, row.cached, @tagName(row.reason), w.queue_ns,
++            w.attempts, w.context_full, w.fill_busy, w.insufficient_total, w.fragmented, w.other_context_full,
++            w.first_enqueue orelse 0, w.last_dequeue orelse 0,
++        });
++        std.debug.print("aiops-admission-gates v1 {d} {any} {any}\n", .{ row.id, w.by_gate_ns, w.checks });
++        for ([_]admission.Placement{ w.last_placement, w.last_failed_placement }, 0..) |p, which| {
++            std.debug.print("aiops-admission-pool v1 {d} {d} {d} {d} {d} {d} {d} {d} {d}\n", .{
++                row.id, which, @intFromBool(p.observed), p.pool, p.wanted, p.reserved, p.free, p.largest, p.live,
++            });
++        }
+     }
+ 
+     const Mark = struct { at: i96, tokens: u64 };
+@@ -139,6 +222,7 @@
+         // A refused placement waits for occupancy to fall or its deadline. Other queued work may still fit.
+         full_wait: ?usize = null,
+         full_retry: i96 = 0,
++        admission_wait: admission.Wait = .{},
+ 
+         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
+         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+@@ -235,6 +319,14 @@
+                 } else |_| {}
+             }
+         }
++        if (std.c.getenv("TF_AI_OPS_ADMISSION")) |v| {
++            if (std.mem.eql(u8, std.mem.span(v), "1")) {
++                if (gpa.create(AdmissionTrace)) |trace| {
++                    trace.* = .{};
++                    host.admission_trace = trace;
++                } else |_| {}
++            }
++        }
+         return host;
+     }
+ 
+@@ -255,6 +347,11 @@
+             h.gpa.destroy(trace);
+             h.trace = null;
+         }
++        if (h.admission_trace) |trace| {
++            h.flushAdmissions();
++            h.gpa.destroy(trace);
++            h.admission_trace = null;
++        }
+         h.queued.deinit(h.gpa);
+         h.admitted.deinit(h.gpa);
+         h.cancels.deinit(h.gpa);
+@@ -289,6 +386,8 @@
+             h.gpa.destroy(job);
+             return error.Closed;
+         }
++        job.admission_wait.enabled = h.admission_trace != null;
++        if (h.admissionTime()) |at| job.admission_wait.enqueue(at, .unexamined);
+         // foreground before background, each in arrival order (the Python job queue's priority)
+         var at = h.queued.items.len;
+         if (!request.background) {
+@@ -385,6 +484,13 @@
+     }
+ 
+     fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
++        if (h.admission_trace) |t| {
++            job.admission_wait.end(h.admissionTime().?);
++            t.pushAdmission(.{
++                .id = job.id, .prompt = job.request.prompt.len, .max_new = job.request.max_tokens,
++                .cached = if (job.started) job.stream.cached else 0, .reason = reason, .wait = job.admission_wait,
++            });
++        }
+         job.reported();
+         h.gpa.free(job.marks);
+         const s = &job.stream;
+@@ -425,6 +531,7 @@
+         var dropped: std.ArrayList(*Job) = .empty;
+         for (ids) |id| {
+             for (h.queued.items, 0..) |job, i| if (job.id == id) {
++                if (h.admissionTime()) |at| job.admission_wait.end(at);
+                 dropped.append(h.gpa, h.queued.orderedRemove(i)) catch {};
+                 break;
+             };
+@@ -474,39 +581,69 @@
+         h.core.rounds_since = 0;
+     }
+ 
++    /// Called with the queue mutex held; diagnostics never choose a request.
++    fn observeQueued(h: *LaneHost, gate: admission.Gate) void {
++        const at = h.admissionTime() orelse return;
++        for (h.queued.items) |job| job.admission_wait.observe(gate, at);
++    }
++
+     /// Prefills the next queued request (while a pass fills, the first that core.cutsIn).
+     /// False also ends the admission burst after a cached cut-in so the decode loop gets a turn.
+     fn admitOne(h: *LaneHost) bool {
+         h.lock();
+-        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes or h.parked_fill != null) {
++        if (h.queued.items.len == 0) {
+             h.unlock();
+             return false;
+         }
++        if (h.admitted.items.len >= h.info_.lanes or h.parked_fill != null) {
++            h.observeQueued(if (h.admitted.items.len >= h.info_.lanes) .slots_full else .parked_fill);
++            h.unlock();
++            return false;
++        }
+         if (h.filling != null and h.filling.?.entry != null) {
+             // Some backends consume reuse only in a later piece: another admission must not mutate its borrowed cache entry.
++            h.observeQueued(.borrowed_cache);
+             h.unlock();
+             return false;
+         }
+         const now_admit = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         const active = h.core.activeCount();
++        h.observeQueued(.unexamined);
+         const at = for (h.queued.items, 0..) |j, i| {
+             if (j.full_wait) |n| {
+-                if (active > 0 and active >= n and now_admit < j.full_retry) continue;
++                if (active > 0 and active >= n and now_admit < j.full_retry) {
++                    if (j.admission_wait.enabled) j.admission_wait.observe(.context_retry, now_admit);
++                    continue;
++                }
+             }
+             if (h.filling == null) break i;
+-            if (j.wait_for_fill) continue;
++            if (j.wait_for_fill) {
++                if (j.admission_wait.enabled) j.admission_wait.observe(.fill_wait, now_admit);
++                continue;
++            }
+             const r = j.request;
+             if (h.core.cutsIn(r.prompt.len, r.images.len > 0)) break i;
+-            if (!h.core.cut_in_reuse or !h.core.cutsIn(0, r.images.len > 0)) continue;
+-            const store = h.cache orelse continue;
+-            const entry = store.find(keyOf(r), r.chunks) orelse continue;
++            if (!h.core.cut_in_reuse or !h.core.cutsIn(0, r.images.len > 0)) {
++                if (j.admission_wait.enabled) j.admission_wait.observe(.cut_in_disabled, now_admit);
++                continue;
++            }
++            const store = h.cache orelse {
++                if (j.admission_wait.enabled) j.admission_wait.observe(.no_cached_prefix, now_admit);
++                continue;
++            };
++            const entry = store.find(keyOf(r), r.chunks) orelse {
++                if (j.admission_wait.enabled) j.admission_wait.observe(.no_cached_prefix, now_admit);
++                continue;
++            };
+             if (h.core.cutsIn(r.prompt.len -| entry.at, false) or h.canPieceCutIn(r, entry.at)) break i;
++            if (j.admission_wait.enabled) j.admission_wait.observe(.cached_cut_in_ineligible, now_admit);
+         } else {
+             h.unlock();
+             return false;
+         };
+         if (h.finish_until) |t| {
+             if (std.Io.Clock.awake.now(h.io).toNanoseconds() < t and h.nearEnd()) {
++                h.observeQueued(.finish_gate);
+                 h.unlock();
+                 return false;
+             }
+@@ -515,6 +652,7 @@
+         const complete_first = h.filling == null and h.core.cut_in_reuse and h.core.fill_rounds > 0 and
+             @as(i64, h.queued.items[at].request.max_tokens) > finish_left and h.nearLongRunnableEnd();
+         const job = h.queued.orderedRemove(at);
++        if (h.admissionTime()) |at_ns| job.admission_wait.dequeue(at_ns);
+         job.wait_for_fill = false;
+         job.full_wait = null;
+         h.admitted.append(h.gpa, job) catch {
+@@ -564,6 +702,7 @@
+             return h.drop(job, "out of memory");
+         };
+         job.started = true;
++        job.stream.observe_admission = job.admission_wait.enabled;
+         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         job.began = began;
+         if (h.loneFits(job)) return h.runLone(job, began);
+@@ -595,6 +734,7 @@
+         h.core.fill_first = fill_first;
+         h.recordSpan(.admission, span_start, job.id, r.prompt.len, job.stream.cached);
+         add catch |e| {
++            if (job.admission_wait.enabled) job.admission_wait.placement(job.stream.admission_placement, e);
+             if (parent) |p| h.core.filling = &p.stream;
+             if (h.between_err != null) {
+                 _ = h.drop(job, h.words(e));
+@@ -608,6 +748,7 @@
+             }
+             return h.drop(job, h.words(e));
+         };
++        if (job.admission_wait.enabled) job.admission_wait.placement(job.stream.admission_placement, null);
+         // Native backends restore before their first piece: release that borrow before a cut-in can replace or evict it.
+         if (job.entry) |e| if (job.stream.reuse_failed or job.stream.cached == e.at) job.reported();
+         if (parent) |p| {
+@@ -818,6 +959,7 @@
+             job.full_wait = h.core.activeCount();
+             job.full_retry = std.Io.Clock.awake.now(h.io).toNanoseconds() + full_retry_ns;
+         }
++        if (h.admissionTime()) |at| job.admission_wait.enqueue(at, if (job.wait_for_fill) .fill_wait else .context_retry);
+         h.unlock();
+         return false;
+     }
+@@ -890,10 +1032,13 @@
+                     h.unlock();
+                     continue;
+                 }
+-                if (h.trace) |trace| {
+-                    if (h.queued.items.len == 0 and h.admitted.items.len == 0 and trace.len != 0) {
++                if (h.queued.items.len == 0 and h.admitted.items.len == 0) {
++                    const spans_pending = if (h.trace) |trace| trace.len != 0 else false;
++                    const admissions_pending = if (h.admission_trace) |trace| trace.admission_len != 0 else false;
++                    if (spans_pending or admissions_pending) {
+                         h.unlock();
+                         h.flushSpans();
++                        h.flushAdmissions();
+                         continue;
+                     }
+                 }
+@@ -942,6 +1087,132 @@
+         h.takeCancels();
+     }
+ };
++
++test "admission diagnostics observe a gate and cancellation without changing queue placement" {
++    const probe = @import("cache_refresh_borrow_test.zig");
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 0 });
++    defer {
++        host.closeAll();
++        host.stop();
++    }
++    const r: Request = .{ .prompt = &.{ 1, 2, 3 }, .max_tokens = 8, .drafts = false };
++    if (host.admission_trace == null) {
++        if (host.trace == null) {
++            host.trace = try gpa.create(LaneHost.SpanTrace);
++            host.trace.?.* = .{};
++        }
++        try host.engine().submit(41, &r, .{ .ctx = &target, .event = probe.event });
++        try std.testing.expect(!host.admitOne());
++        const pending_without_diagnostics = host.queued.items[0];
++        try std.testing.expect(!pending_without_diagnostics.admission_wait.enabled);
++        try std.testing.expectEqual(@as(?i96, null), pending_without_diagnostics.admission_wait.first_enqueue);
++        try std.testing.expectEqual(@as(u32, 0), pending_without_diagnostics.admission_wait.checks[@backingInt(admission.Gate.slots_full)]);
++        host.closeAll();
++
++        host.admission_trace = try gpa.create(LaneHost.AdmissionTrace);
++        host.admission_trace.?.* = .{};
++    }
++    try host.engine().submit(42, &r, .{ .ctx = &target, .event = probe.event });
++    try std.testing.expect(!host.admitOne());
++    try std.testing.expectEqual(@as(usize, 1), host.queued.items.len);
++    try std.testing.expectEqual(@as(u32, 1), host.queued.items[0].admission_wait.checks[@backingInt(admission.Gate.slots_full)]);
++    host.info_.lanes = 1;
++    _ = host.admitOne();
++    try std.testing.expectEqual(@as(usize, 1), host.admitted.items.len);
++    try std.testing.expectEqual(@as(u32, 8), host.admitted.items[0].stream.max_new);
++    try host.engine().submit(43, &r, .{ .ctx = &target, .event = probe.event });
++    try std.testing.expect(!host.admitOne());
++    host.closeAll();
++    const rows = host.admission_trace.?.admissions[0..host.admission_trace.?.admission_len];
++    try std.testing.expectEqual(@as(usize, 2), rows.len);
++    for (rows) |row| {
++        try std.testing.expectEqual(Reason.cancelled, row.reason);
++        try std.testing.expectEqual(@as(u32, 8), row.max_new);
++        try std.testing.expectEqual(@as(u32, if (row.id == 42) 1 else 0), row.wait.attempts);
++        var sum: u64 = 0;
++        for (row.wait.by_gate_ns) |ns| sum += ns;
++        try std.testing.expectEqual(row.wait.queue_ns, sum);
++    }
++}
++
++test "admission diagnostics preserve ContextFull evidence through a real host retry" {
++    const probe = @import("cache_refresh_borrow_test.zig");
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    if (host.admission_trace == null) {
++        host.admission_trace = try gpa.create(LaneHost.AdmissionTrace);
++        host.admission_trace.?.* = .{};
++    }
++    defer {
++        host.closeAll();
++        host.stop();
++    }
++    const r: Request = .{ .prompt = &.{ 1, 2, 3 }, .max_tokens = 8, .drafts = false };
++    try host.engine().submit(51, &r, .{ .ctx = &target, .event = probe.event });
++    _ = host.admitOne();
++    target.refuse_full = 1;
++    try host.engine().submit(52, &r, .{ .ctx = &target, .event = probe.event });
++    try std.testing.expect(!host.admitOne());
++    try std.testing.expectEqual(@as(usize, 1), host.queued.items.len);
++    const pending = host.queued.items[0];
++    try std.testing.expectEqual(@as(u32, 1), pending.admission_wait.context_full);
++    try std.testing.expectEqual(@as(u32, 1), pending.admission_wait.attempts);
++    try std.testing.expect(!pending.admission_wait.last_failed_placement.observed); // fake has no pool telemetry
++    try std.testing.expect(!host.admitOne()); // original per-job retry policy still applies
++    try std.testing.expect(pending.admission_wait.checks[@backingInt(admission.Gate.context_retry)] > 0);
++    pending.full_retry = 0; // advance just this fixture's retry deadline without sleeping
++    _ = host.admitOne();
++    try std.testing.expectEqual(@as(usize, 2), host.admitted.items.len);
++    try std.testing.expectEqual(@as(u32, 2), pending.admission_wait.attempts);
++    try std.testing.expectEqual(@as(u32, 1), pending.admission_wait.context_full);
++    try std.testing.expectEqual(@as(u32, 8), pending.stream.max_new);
++    try std.testing.expect(pending.admission_wait.first_enqueue.? <= pending.admission_wait.last_dequeue.?);
++}
++
++test "admission diagnostics have an independent bounded buffer with explicit loss count" {
++    const gpa = std.testing.allocator;
++    const trace = try gpa.create(LaneHost.AdmissionTrace);
++    defer gpa.destroy(trace);
++    trace.* = .{};
++    const row: LaneHost.AdmissionTrace.AdmissionRow = .{
++        .id = 7, .prompt = 3, .max_new = 8, .cached = 0, .reason = .stop, .wait = .{},
++    };
++    for (0..trace.admissions.len + 1) |_| trace.pushAdmission(row);
++    try std.testing.expectEqual(trace.admissions.len, trace.admission_len);
++    try std.testing.expectEqual(@as(u64, 1), trace.admission_dropped);
++
++    var important = row;
++    important.id = 8;
++    important.wait.queue_ns = LaneHost.AdmissionTrace.priority_wait_ns;
++    trace.pushAdmission(important);
++    try std.testing.expectEqual(@as(Id, 8), trace.overflowAt(0).id);
++
++    important = row;
++    important.wait.context_full = 1;
++    for (0..trace.admission_overflow.len) |index| {
++        important.id = @intCast(index + 9);
++        trace.pushAdmission(important);
++    }
++    try std.testing.expectEqual(trace.admission_overflow.len, trace.admission_overflow_len);
++    try std.testing.expectEqual(@as(Id, 9), trace.overflowAt(0).id);
++    try std.testing.expectEqual(@as(Id, 264), trace.overflowAt(trace.admission_overflow_len - 1).id);
++    try std.testing.expectEqual(@as(u64, 2), trace.admission_dropped);
++}
+ 
+ test "a lane host serves the core's own tokens, in order, and cancels between rounds" {
+     const gpa = std.testing.allocator;
+diff --git a/zig/src/core/lanes/admission_observation.zig b/zig/src/core/lanes/admission_observation.zig
+new file mode 100644
+--- /dev/null
++++ b/zig/src/core/lanes/admission_observation.zig
+@@ -0,0 +1,179 @@
++//! Numeric-only admission diagnostics. No policy, prompt contents, or allocations.
++const std = @import("std");
++
++// Durations are time since the LAST OBSERVED gate, not proof that it blocked
++// continuously. Unexamined time is explicit; admission execution is excluded.
++pub const Gate = enum {
++    unexamined,
++    slots_full,
++    parked_fill,
++    borrowed_cache,
++    context_retry,
++    fill_wait,
++    cut_in_disabled,
++    no_cached_prefix,
++    cached_cut_in_ineligible,
++    finish_gate,
++};
++pub const gate_count = @typeInfo(Gate).@"enum".field_names.len;
++
++pub const Placement = struct {
++    observed: bool = false,
++    pool: usize = 0,
++    wanted: usize = 0,
++    reserved: usize = 0,
++    free: usize = 0,
++    largest: usize = 0,
++    live: usize = 0,
++};
++
++/// Union of live extents only. Kept-state protection is deliberately NOT
++/// represented as ordinary occupied capacity. Handles unsorted/overlapping input.
++pub fn measurePool(live: []const [2]usize, cap: usize, wanted: usize, alignment: usize) Placement {
++    var p: Placement = .{ .observed = true, .pool = cap, .wanted = wanted, .live = live.len };
++    var cursor: usize = 0;
++    while (cursor < cap) {
++        var next = cap;
++        var end = cursor;
++        for (live) |e| {
++            if (e[0] <= cursor and e[1] > cursor) end = @max(end, @min(e[1], cap));
++            if (e[0] > cursor) next = @min(next, e[0]);
++        }
++        if (end > cursor) {
++            cursor = end;
++        } else {
++            p.free += next - cursor;
++            const aligned = std.mem.alignForward(usize, cursor, alignment);
++            p.largest = @max(p.largest, next -| aligned);
++            cursor = next;
++        }
++    }
++    p.reserved = cap - p.free;
++    return p;
++}
++
++pub const Wait = struct {
++    enabled: bool = false,
++    first_enqueue: ?i96 = null,
++    last_dequeue: ?i96 = null,
++    queued_at: ?i96 = null,
++    last_at: i96 = 0,
++    last_gate: Gate = .unexamined,
++    queue_ns: u64 = 0,
++    by_gate_ns: [gate_count]u64 = @splat(0),
++    checks: [gate_count]u32 = @splat(0),
++    attempts: u32 = 0,
++    context_full: u32 = 0,
++    fill_busy: u32 = 0,
++    insufficient_total: u32 = 0,
++    fragmented: u32 = 0,
++    other_context_full: u32 = 0,
++    last_placement: Placement = .{},
++    last_failed_placement: Placement = .{},
++
++    pub fn enqueue(w: *Wait, at: i96, gate: Gate) void {
++        if (!w.enabled) return;
++        if (w.first_enqueue == null) w.first_enqueue = at;
++        w.queued_at = at;
++        w.last_at = at;
++        w.last_gate = gate;
++    }
++
++    fn account(w: *Wait, at: i96) void {
++        if (!w.enabled or w.queued_at == null) return;
++        const ns: u64 = @intCast(@min(std.math.maxInt(u64), @max(0, at - w.last_at)));
++        w.queue_ns +|= ns;
++        w.by_gate_ns[@backingInt(w.last_gate)] +|= ns;
++        w.last_at = @max(w.last_at, at);
++    }
++
++    pub fn observe(w: *Wait, gate: Gate, at: i96) void {
++        if (!w.enabled or w.queued_at == null) return;
++        w.account(at);
++        w.last_gate = gate;
++        w.checks[@backingInt(gate)] +|= 1;
++    }
++
++    pub fn dequeue(w: *Wait, at: i96) void {
++        if (!w.enabled or w.queued_at == null) return;
++        w.account(at);
++        w.queued_at = null;
++        w.last_dequeue = at;
++        w.attempts +|= 1;
++    }
++
++    pub fn end(w: *Wait, at: i96) void {
++        w.account(at); // includes a queued cancellation, without inventing an attempt
++        w.queued_at = null;
++    }
++
++    pub fn placement(w: *Wait, p: Placement, err: ?anyerror) void {
++        if (!w.enabled) return;
++        w.last_placement = p;
++        const failure = err orelse return;
++        if (failure == error.FillBusy) w.fill_busy +|= 1;
++        if (failure == error.ContextFull) {
++            w.context_full +|= 1;
++            w.last_failed_placement = p;
++            if (p.observed and p.wanted > p.free) {
++                w.insufficient_total +|= 1;
++            } else if (p.observed and p.wanted > p.largest) {
++                w.fragmented +|= 1;
++            } else w.other_context_full +|= 1; // does not invent a cache-victim cause
++        }
++    }
++};
++
++test "admission wait excludes attempt work and preserves distinct retry episodes" {
++    var w: Wait = .{ .enabled = true };
++    w.enqueue(100, .unexamined);
++    w.observe(.slots_full, 110);
++    w.observe(.slots_full, 130);
++    w.dequeue(150);
++    w.enqueue(1000, .context_retry); // 850ns inside attempted admission is NOT queue wait
++    w.observe(.unexamined, 1020);
++    w.dequeue(1030);
++    try std.testing.expectEqual(@as(u64, 80), w.queue_ns);
++    try std.testing.expectEqual(@as(u64, 20), w.by_gate_ns[@backingInt(Gate.unexamined)]);
++    try std.testing.expectEqual(@as(u64, 40), w.by_gate_ns[@backingInt(Gate.slots_full)]);
++    try std.testing.expectEqual(@as(u64, 20), w.by_gate_ns[@backingInt(Gate.context_retry)]);
++    try std.testing.expectEqual(@as(u32, 2), w.attempts);
++}
++
++test "admission disabled diagnostics are inert and queued cancellation is not an attempt" {
++    var off: Wait = .{};
++    off.enqueue(10, .unexamined);
++    off.observe(.slots_full, 20);
++    off.dequeue(30);
++    off.placement(.{}, error.ContextFull);
++    try std.testing.expectEqualDeep(Wait{}, off);
++    var on: Wait = .{ .enabled = true };
++    on.enqueue(10, .unexamined);
++    on.end(35);
++    try std.testing.expectEqual(@as(u64, 25), on.queue_ns);
++    try std.testing.expectEqual(@as(u32, 0), on.attempts);
++}
++
++test "admission pool distinguishes total free from contiguous aligned room" {
++    const p = measurePool(&.{ .{ 12, 16 }, .{ 0, 4 }, .{ 4, 6 } }, 24, 10, 4);
++    try std.testing.expectEqual(@as(usize, 10), p.reserved);
++    try std.testing.expectEqual(@as(usize, 14), p.free);
++    try std.testing.expectEqual(@as(usize, 8), p.largest);
++    var w: Wait = .{ .enabled = true };
++    w.placement(p, error.ContextFull);
++    try std.testing.expectEqual(@as(u32, 1), w.fragmented);
++    w.placement(measurePool(&.{.{ 0, 20 }}, 24, 8, 4), error.ContextFull);
++    try std.testing.expectEqual(@as(u32, 1), w.insufficient_total);
++    w.placement(measurePool(&.{}, 24, 8, 4), error.ContextFull);
++    try std.testing.expectEqual(@as(u32, 1), w.other_context_full);
++    w.placement(.{}, error.FillBusy);
++    try std.testing.expectEqual(@as(u32, 1), w.fill_busy);
++}
++
++test "admission pool unions overlaps and handles empty and full pools" {
++    const p = measurePool(&.{ .{ 8, 20 }, .{ 2, 10 } }, 24, 1, 4);
++    try std.testing.expectEqual(@as(usize, 6), p.free);
++    try std.testing.expectEqual(@as(usize, 4), p.largest);
++    try std.testing.expectEqual(@as(usize, 24), measurePool(&.{}, 24, 8, 4).largest);
++    try std.testing.expectEqual(@as(usize, 0), measurePool(&.{.{ 0, 24 }}, 24, 8, 4).free);
++}
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -7,6 +7,7 @@
+ const Proposer = @import("proposer.zig").Proposer;
+ const Sampling = @import("sampling.zig").Sampling;
+ const State = @import("depth.zig").State;
++pub const admission_observation = @import("admission_observation.zig");
+ 
+ pub const Reason = enum {
+     none,
+@@ -180,6 +181,8 @@
+     /// backend may call between two of this stream's prompt chunks; null: the pass runs whole, as before.
+     between: ?Between = null,
+     cut_in_limit: u32 = 0, // nonzero when entering a running fill on the strength of a cached prefix
++    observe_admission: bool = false,
++    admission_placement: admission_observation.Placement = .{},
+     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
+     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
+     context: std.ArrayList(u32) = .empty,
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -628,6 +628,8 @@
+             taken[nt] = .{ l.base, l.end };
+             nt += 1;
+         }
++        if (s.observe_admission)
++            s.admission_placement = lanes.stream.admission_observation.measurePool(taken[0..nt], m.pool_cap, size, model.chunk_rows);
+         // a kept state of this prompt's prefix: the pass resumes at its chunk end, in its extent, or in one of its own
+         // with the kept rows copied there when a live stream holds that extent (a burst's second request on a prompt)
+         s.cached = 0;

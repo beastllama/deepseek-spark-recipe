@@ -1,5 +1,7 @@
 # Reproduction status
 
+The [November 17 profile](KV-POOL-786432.md) records the selected 786,432-position pool, the exact heartbeat source, and the separately instrumented capacity comparison. The saved production recall recovered 16/16 keys. The public source can be checked against its manifest. Rebuilding this public recipe on independent Spark hardware and reproducing the measured binaries are pending.
+
 The [November 15 admission benchmark](ADMISSION-BENCHMARK.md) adds exact source closures for both engine arms and a pinned SparkDash 2.90.0 fixture. Both ordered engine patches were applied and every listed file hash verified offline. The dashboard fixture passed eight focused mock tests. Typecheck and build passed with a validation-only Windows import workaround. The full Windows test attempt hit module and fixture setup errors outside the focused tests. The public patch was applied separately to the exact pin in Ubuntu. The two saved GPU results came from the measured deployment. Independent hardware reproduction of the public packaging is pending.
 
 This publication contains measured results and an exact source/configuration recipe. **A clean public ARM64/GPU build and independent reproduction remain unexecuted.** The saved operational UI jobs qualify the exact retained artifacts identified below; they do not qualify a clean build of this public packaging.

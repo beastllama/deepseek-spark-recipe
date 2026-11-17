@@ -25,7 +25,11 @@ case "${ADMISSION_PROFILE:-historical}" in
     worker_pool=655360
     worker_context=(--context 524288)
     ;;
-  *) echo 'ADMISSION_PROFILE must be historical, baseline or shared-pool' >&2; exit 2 ;;
+  shared-pool-768)
+    worker_pool=786432
+    worker_context=(--context 524288)
+    ;;
+  *) echo 'ADMISSION_PROFILE must be historical, baseline, shared-pool or shared-pool-768' >&2; exit 2 ;;
 esac
 if [[ "$rank" == worker ]]; then
   exec "$BIN_ROOT/bin/tf-dsv41-lanes" "$CHECKPOINT_DIR" "$RANK_CACHE_DIR" 1 2 \
@@ -38,7 +42,7 @@ export TF_DS_RANK_CACHE="$RANK_CACHE_DIR" TF_DS_FINE_SNAPSHOT_128=1 TF_AI_OPS_SP
 if [[ "${ADMISSION_PROFILE:-historical}" != historical ]]; then
   export TF_CACHED_FILL_PIECES_MAX=16384
 fi
-if [[ "${ADMISSION_PROFILE:-historical}" == shared-pool ]]; then
+if (( worker_pool != 524288 )); then
   export TF_DS_POOL_TOKENS="$worker_pool"
 fi
 api_host=${API_HOST:-127.0.0.1}
