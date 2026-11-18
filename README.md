@@ -1,5 +1,7 @@
 # DeepSeek on two DGX Sparks: measured stack and reproduction recipe
 
+**November 17 short-request scheduling.** A 61-token cold request queued for 1.96 s versus 10.52 s on the same eight-lane, 786,432-position pool. Its output token sequence matched. The five-job wave finished in 34.81 s versus 41.32 s with 17% fewer output tokens overall. [Source, reproduction steps and tradeoffs](BOUNDED-SHORT-ADMISSION.md).
+
 **November 17 production profile.** The selected 786,432-position shared KV pool keeps 524,288 context per request, eight lanes, EAQ v1 plus matching abliterated Keys, and the 25-second streaming heartbeat. The five-request SparkDash wave took 37.86 s versus 41.02 s at 655,360 positions. The short request waited longer, and streaming pauses grew. [Build, launch, benchmark, and tradeoffs](KV-POOL-786432.md).
 
 **November 15 admission benchmark.** A larger shared pool admitted four long requests where three fit before, with the same request context and output allowance. The measured wave took 33.53 s versus 42.44 s. Outputs varied and streaming pauses grew. [Protocol, build pins and tradeoffs](ADMISSION-BENCHMARK.md).

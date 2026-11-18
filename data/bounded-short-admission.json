@@ -1,0 +1,232 @@
+{
+  "date_local": "2026-11-17",
+  "protocol": "SparkDash admission-pool-v1",
+  "arms_per_setting": 1,
+  "cold_prime_excluded_from_wave": true,
+  "public_lanes": 8,
+  "logical_context": 524288,
+  "kv_positions": 786432,
+  "snapshot_gib": 1,
+  "arms": {
+    "baseline": {
+      "bench_id": "2f624984-3926-42f6-bf78-b62ffd9a5ba9",
+      "wave_ms": 41315.55466700019,
+      "requests_per_minute": 7.2611877637363005,
+      "output_tokens": 3853,
+      "output_tokens_per_wave_second": 93.25785484558655,
+      "p95_longest_sse_gap_ms": 1377.54,
+      "native_enqueue_order": [
+        "Admission tail 2048",
+        "Admission tail 1024",
+        "Admission tail 4096",
+        "Admission tail 8192",
+        "Short backup triage"
+      ],
+      "native_dequeue_order": [
+        "Admission tail 2048",
+        "Admission tail 1024",
+        "Admission tail 4096",
+        "Admission tail 8192",
+        "Short backup triage"
+      ],
+      "geometry": {
+        "longReservations": [
+          167936,
+          169984,
+          172032,
+          176128
+        ],
+        "longReservedTokens": 686080,
+        "shortReservedTokens": 34816,
+        "totalReservedTokens": 720896,
+        "threeLongAndShort": 552960
+      },
+      "roles": {
+        "Admission tail 2048": {
+          "prompt": 135376,
+          "cached": 133120,
+          "max_output": 32768,
+          "output": 933,
+          "reason": "stop",
+          "queue_ms": 0.014576,
+          "first_token_ms": 11590.42,
+          "first_answer_ms": 36325.84,
+          "completion_ms": 39951.56,
+          "longest_sse_gap_ms": 130.94
+        },
+        "Admission tail 1024": {
+          "prompt": 134352,
+          "cached": 133120,
+          "max_output": 32768,
+          "output": 644,
+          "reason": "stop",
+          "queue_ms": 1237.180899,
+          "first_token_ms": 2311.26,
+          "first_answer_ms": 23176.32,
+          "completion_ms": 34809.26,
+          "longest_sse_gap_ms": 1377.51
+        },
+        "Admission tail 4096": {
+          "prompt": 137424,
+          "cached": 133120,
+          "max_output": 32768,
+          "output": 653,
+          "reason": "stop",
+          "queue_ms": 2185.399462,
+          "first_token_ms": 4906.87,
+          "first_answer_ms": 24442.67,
+          "completion_ms": 33875.37,
+          "longest_sse_gap_ms": 1377.54
+        },
+        "Admission tail 8192": {
+          "prompt": 141520,
+          "cached": 133120,
+          "max_output": 32768,
+          "output": 976,
+          "reason": "stop",
+          "queue_ms": 4802.571537,
+          "first_token_ms": 10671.37,
+          "first_answer_ms": 37566.78,
+          "completion_ms": 41308.13,
+          "longest_sse_gap_ms": 450.09
+        },
+        "Short backup triage": {
+          "prompt": 61,
+          "cached": 0,
+          "max_output": 32768,
+          "output": 647,
+          "reason": "stop",
+          "queue_ms": 10519.457849,
+          "first_token_ms": 10733.51,
+          "first_answer_ms": 31428.45,
+          "completion_ms": 35931.23,
+          "longest_sse_gap_ms": 449.59
+        }
+      }
+    },
+    "candidate": {
+      "bench_id": "83be1ed2-b1a1-42ae-8c1e-7d5f6d093204",
+      "wave_ms": 34808.05783800001,
+      "requests_per_minute": 8.618694021833345,
+      "output_tokens": 3200,
+      "output_tokens_per_wave_second": 91.93273623288903,
+      "p95_longest_sse_gap_ms": 1140.06,
+      "native_enqueue_order": [
+        "Admission tail 1024",
+        "Admission tail 2048",
+        "Admission tail 4096",
+        "Admission tail 8192",
+        "Short backup triage"
+      ],
+      "native_dequeue_order": [
+        "Admission tail 1024",
+        "Admission tail 2048",
+        "Short backup triage",
+        "Admission tail 4096",
+        "Admission tail 8192"
+      ],
+      "geometry": {
+        "longReservations": [
+          167936,
+          169984,
+          172032,
+          176128
+        ],
+        "longReservedTokens": 686080,
+        "shortReservedTokens": 34816,
+        "totalReservedTokens": 720896,
+        "threeLongAndShort": 552960
+      },
+      "roles": {
+        "Admission tail 1024": {
+          "prompt": 134352,
+          "cached": 133120,
+          "max_output": 32768,
+          "output": 512,
+          "reason": "stop",
+          "queue_ms": 0.104912,
+          "first_token_ms": 1101.87,
+          "first_answer_ms": 19012.96,
+          "completion_ms": 28142.44,
+          "longest_sse_gap_ms": 1140.06
+        },
+        "Admission tail 2048": {
+          "prompt": 135376,
+          "cached": 133120,
+          "max_output": 32768,
+          "output": 575,
+          "reason": "stop",
+          "queue_ms": 932.240315,
+          "first_token_ms": 5440.16,
+          "first_answer_ms": 22878.17,
+          "completion_ms": 31282.7,
+          "longest_sse_gap_ms": 1136.97
+        },
+        "Admission tail 4096": {
+          "prompt": 137424,
+          "cached": 133120,
+          "max_output": 32768,
+          "output": 741,
+          "reason": "stop",
+          "queue_ms": 2326.863743,
+          "first_token_ms": 5048.85,
+          "first_answer_ms": 27878.03,
+          "completion_ms": 34706.69,
+          "longest_sse_gap_ms": 1137.71
+        },
+        "Admission tail 8192": {
+          "prompt": 141520,
+          "cached": 133120,
+          "max_output": 32768,
+          "output": 725,
+          "reason": "stop",
+          "queue_ms": 5335.868655,
+          "first_token_ms": 11191.99,
+          "first_answer_ms": 29965.16,
+          "completion_ms": 34788.42,
+          "longest_sse_gap_ms": 111.44
+        },
+        "Short backup triage": {
+          "prompt": 61,
+          "cached": 0,
+          "max_output": 32768,
+          "output": 647,
+          "reason": "stop",
+          "queue_ms": 1955.66702,
+          "first_token_ms": 2196.82,
+          "first_answer_ms": 28849.32,
+          "completion_ms": 33310.31,
+          "longest_sse_gap_ms": 1140.06
+        }
+      }
+    }
+  },
+  "prompt_and_output_token_hash_match_by_role": {
+    "Admission tail 1024": {
+      "promptSha256": false,
+      "tokenSha": false
+    },
+    "Admission tail 2048": {
+      "promptSha256": false,
+      "tokenSha": false
+    },
+    "Admission tail 4096": {
+      "promptSha256": false,
+      "tokenSha": false
+    },
+    "Admission tail 8192": {
+      "promptSha256": false,
+      "tokenSha": false
+    },
+    "Short backup triage": {
+      "promptSha256": true,
+      "tokenSha": true
+    }
+  },
+  "candidate_measured_completions_including_prime": 6,
+  "candidate_disconnections_delta": 0,
+  "observed_overtakes": 1,
+  "baseline_head_sha256": "85976d5d5f11dfa21ada2c420ed059d7b0adaacf41dc60a3ee5ed1a64e5d38fc",
+  "candidate_head_sha256": "dc27fdfa93867a503049359659b14afbe062f3a2a7d8ad479c60a33e08cb469d",
+  "reconstruction_patch_sha256": "23901d1fe5b9d7c166bd8bc841a69cd8a2512115b6ccf1049c1f750f9cd4ee02"
+}
