@@ -1,0 +1,587 @@
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 89e3fe49cf1db3224ea78e25c67b111f11e9ecff..50fffd1d464bb6ea289bdda75759645f83319b40 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -16,6 +16,7 @@ const Reason = api.Reason;
+ const Stats = api.Stats;
+ const SubmitError = api.SubmitError;
+ const admission = lanes.stream.admission_observation;
++const yield_observation = lanes.backend.yield_observation;
+ 
+ pub const LaneHost = struct {
+     gpa: Allocator,
+@@ -60,8 +61,10 @@ pub const LaneHost = struct {
+     between_err: ?anyerror = null,
+     trace: ?*SpanTrace = null,
+     admission_trace: ?*AdmissionTrace = null,
++    yield_trace: ?*yield_observation.Trace = null,
++    bounded_short_overtake: bool = false,
+ 
+-    const SpanKind = enum { admission, fill, nested_decode, decode, emit, emit_gap };
++    const SpanKind = enum { admission, fill, nested_decode, decode, emit, emit_gap, short_overtake };
+     const Span = struct {
+         kind: SpanKind,
+         start: i96,
+@@ -139,6 +142,100 @@ pub const LaneHost = struct {
+         return std.Io.Clock.awake.now(h.io).toNanoseconds();
+     }
+ 
++    /// Probe the first eligible cold short behind the ordinary choice. Queue mutex held.
++    fn probeShort(h: *LaneHost, parent: *Job, chosen: usize, started: i96, scanned: *u64) ?yield_observation.Record {
++        const selected = h.queued.items[chosen];
++        const limit = @min(h.queued.items.len, yield_observation.scan_limit);
++        if (chosen + 1 >= limit) return null;
++        const active = h.core.activeCount();
++        for (h.queued.items[chosen + 1 .. limit], chosen + 1..) |job, index| {
++            scanned.* += 1;
++            const r = job.request;
++            if (r.prompt.len == 0 or r.prompt.len > yield_observation.short_prompt_limit or r.images.len > 0 or
++                r.background != selected.request.background or job.wait_for_fill) continue;
++            if (job.full_wait) |n| if (active > 0 and active >= n and started < job.full_retry) continue;
++            if (!h.core.cutsIn(r.prompt.len, false)) continue;
++            if (h.cache) |store| if (store.find(keyOf(r), r.chunks) != null) continue;
++            // Only the unlogged policy path can operate without an observed enqueue time.
++            const enqueued = job.admission_wait.first_enqueue orelse if (h.yield_trace != null) continue else started;
++            const probe_started = std.Io.Clock.awake.now(h.io).toNanoseconds();
++            const fit = if (h.core.backend.vtable.admission_fit) |probe|
++                probe(h.core.backend.ptr, r.prompt.len, r.max_tokens)
++            else yield_observation.Fit{};
++            const ended = std.Io.Clock.awake.now(h.io).toNanoseconds();
++            const probe_ns: u64 = @intCast(@max(0, ended - probe_started));
++            return .{ .at = probe_started, .parent = parent.id, .runnable = h.core.runnableCount(), .selected = selected.id,
++                .selected_prompt = selected.request.prompt.len, .candidate = job.id, .candidate_index = index,
++                .prompt = r.prompt.len, .max_new = r.max_tokens, .age = @intCast(@max(0, probe_started - enqueued)),
++                .fit = fit, .probe_ns = probe_ns, .total_ns = @intCast(@max(0, ended - started)) };
++        }
++        return null;
++    }
++
++    /// Called only after the usual slots, parked fill, cache borrow, selection and finish gates.
++    fn yieldChoice(h: *LaneHost, chosen: usize) usize {
++        const parent = h.filling orelse return chosen;
++        if (h.core.filling != &parent.stream or h.queued.items[chosen].request.prompt.len <= yield_observation.short_prompt_limit)
++            return chosen;
++        // A cancellation may have arrived within this burst. Leave its drain to the ordinary loop.
++        const can_overtake = h.bounded_short_overtake and !parent.used_short_overtake and h.cancels.items.len == 0;
++        const trace = h.yield_trace;
++        const can_record = if (trace) |t| t.len < yield_observation.record_limit else false;
++        if (!can_overtake and !can_record) {
++            if (trace) |t| {
++                t.opportunities +|= 1;
++                t.dropped_opportunities +|= 1;
++            }
++            return chosen;
++        }
++        const started = std.Io.Clock.awake.now(h.io).toNanoseconds();
++        var scanned: u64 = 0;
++        const observation = h.probeShort(parent, chosen, started, &scanned);
++        if (observation) |row| {
++            if (can_overtake and row.fit.status == .fits) {
++                // Spend the allowance before native admission, including failed or cancelled attempts.
++                parent.used_short_overtake = true;
++                if (h.trace) |spans| spans.push(.{ .kind = .short_overtake, .start = row.at,
++                    .end = row.at + row.probe_ns, .job = row.candidate, .work = @intCast(row.selected), .extra = row.parent });
++                return row.candidate_index;
++            }
++        }
++        // v1 observes the actual ordinary long selection. A real overtake instead has its own span above.
++        if (trace) |t| {
++            t.opportunities +|= 1;
++            if (!can_record) {
++                t.dropped_opportunities +|= 1;
++                return chosen;
++            }
++            t.scanned +|= scanned;
++            if (h.queued.items.len > yield_observation.scan_limit) t.scan_limited +|= 1;
++            if (observation) |row| {
++                t.probe_ns +|= row.probe_ns;
++                t.push(row);
++            } else t.no_candidate +|= 1;
++            t.total_ns +|= @intCast(@max(0, std.Io.Clock.awake.now(h.io).toNanoseconds() - started));
++        }
++        return chosen;
++    }
++
++    fn flushYields(h: *LaneHost) void {
++        const trace = h.yield_trace orelse return;
++        if (trace.opportunities == 0) return;
++        for (trace.records[0..trace.len]) |r| {
++            const p = r.fit;
++            std.debug.print("aiops-yield v1 {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {s} {d} {d} {d} {d} {d} {d} {d} {d} {d}\n", .{
++                r.at, r.parent, r.runnable, r.selected, r.selected_prompt, r.candidate, r.candidate_index, r.prompt,
++                r.max_new, r.age, @intFromBool(p.status == .fits), @tagName(p.status), p.pool, p.wanted,
++                p.free, p.largest, p.live, p.protected, p.slots_free, r.probe_ns, r.total_ns,
++            });
++        }
++        std.debug.print("aiops-yield-flush v1 {d} {d} {d} {d} {d} {d} {d} {d}\n", .{
++            trace.len, trace.opportunities, trace.scanned, trace.scan_limited, trace.no_candidate,
++            trace.dropped_opportunities, trace.probe_ns, trace.total_ns,
++        });
++        trace.* = .{};
++    }
++
+     fn admissionTime(h: *const LaneHost) ?i96 {
+         if (h.admission_trace == null) return null;
+         return std.Io.Clock.awake.now(h.io).toNanoseconds();
+@@ -219,6 +316,7 @@ pub const LaneHost = struct {
+         kept0: u64 = 0, // the store's kept count when the job looked it up
+         wait_for_fill: bool = false, // its cached cut-in was refused; retry after the current fill
+         used_piece_cut_in: bool = false, // this original fill has already lent one service opportunity
++        used_short_overtake: bool = false,
+         // A refused placement waits for occupancy to fall or its deadline. Other queued work may still fit.
+         full_wait: ?usize = null,
+         full_retry: i96 = 0,
+@@ -327,6 +425,16 @@ pub const LaneHost = struct {
+                 } else |_| {}
+             }
+         }
++        if (host.admission_trace != null) if (std.c.getenv("TF_AI_OPS_YIELD")) |v| {
++            if (std.mem.eql(u8, std.mem.span(v), "1")) {
++                if (gpa.create(yield_observation.Trace)) |trace| {
++                    trace.* = .{};
++                    host.yield_trace = trace;
++                } else |_| {}
++            }
++        };
++        if (std.c.getenv("TF_BOUNDED_SHORT_OVERTAKE")) |v|
++            host.bounded_short_overtake = std.mem.eql(u8, std.mem.span(v), "1");
+         return host;
+     }
+ 
+@@ -352,6 +460,11 @@ pub const LaneHost = struct {
+             h.gpa.destroy(trace);
+             h.admission_trace = null;
+         }
++        if (h.yield_trace) |trace| {
++            h.flushYields();
++            h.gpa.destroy(trace);
++            h.yield_trace = null;
++        }
+         h.queued.deinit(h.gpa);
+         h.admitted.deinit(h.gpa);
+         h.cancels.deinit(h.gpa);
+@@ -609,7 +722,7 @@ pub const LaneHost = struct {
+         const now_admit = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         const active = h.core.activeCount();
+         h.observeQueued(.unexamined);
+-        const at = for (h.queued.items, 0..) |j, i| {
++        const ordinary = for (h.queued.items, 0..) |j, i| {
+             if (j.full_wait) |n| {
+                 if (active > 0 and active >= n and now_admit < j.full_retry) {
+                     if (j.admission_wait.enabled) j.admission_wait.observe(.context_retry, now_admit);
+@@ -649,6 +762,13 @@ pub const LaneHost = struct {
+             }
+             h.finish_until = null;
+         }
++        const at = h.yieldChoice(ordinary);
++        // Every overtake, including an error or requeue, ends this burst before further admissions.
++        return h.admitChosen(at) and at == ordinary;
++    }
++
++    /// Enters with the queue mutex held, unlocks before native work.
++    fn admitChosen(h: *LaneHost, at: usize) bool {
+         const complete_first = h.filling == null and h.core.cut_in_reuse and h.core.fill_rounds > 0 and
+             @as(i64, h.queued.items[at].request.max_tokens) > finish_left and h.nearLongRunnableEnd();
+         const job = h.queued.orderedRemove(at);
+@@ -1035,10 +1155,12 @@ pub const LaneHost = struct {
+                 if (h.queued.items.len == 0 and h.admitted.items.len == 0) {
+                     const spans_pending = if (h.trace) |trace| trace.len != 0 else false;
+                     const admissions_pending = if (h.admission_trace) |trace| trace.admission_len != 0 else false;
+-                    if (spans_pending or admissions_pending) {
++                    const yields_pending = if (h.yield_trace) |trace| trace.opportunities != 0 else false;
++                    if (spans_pending or admissions_pending or yields_pending) {
+                         h.unlock();
+                         h.flushSpans();
+                         h.flushAdmissions();
++                        h.flushYields();
+                         continue;
+                     }
+                 }
+@@ -1785,3 +1907,125 @@ test "cached-piece admission: restore refusal and pressure preserve parent; late
+         try std.testing.expectEqual(@as(u64, 0), store.counts.failed);
+     }
+ }
++
++test "yield observation preserves the actual selected request and parent fill" {
++    const probe = @import("cache_refresh_borrow_test.zig");
++    const Probe = struct {
++        var calls: usize = 0;
++        fn fit(_: *anyopaque, prompt: usize, max_new: u32) yield_observation.Fit {
++            calls += 1;
++            return yield_observation.placement(&.{.{ 0, 172032 }}, &.{}, 524288, 786432, prompt, max_new, 64, 30);
++        }
++    };
++    for ([_]bool{ false, true }) |enabled| {
++        Probe.calls = 0;
++        const gpa = std.testing.allocator;
++        var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++        defer cfg.deinit(gpa);
++        var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 2 };
++        defer target.deinit();
++        var table = target.backend().vtable.*;
++        table.admission_fit = Probe.fit;
++        var clock: lanes.fake.FixedClock = .{};
++        var core = lanes.Engine.init(gpa, &cfg, .{ .ptr = &target, .vtable = &table }, clock.clock());
++        defer core.deinit();
++        core.fill_chunks = 1;
++        core.fill_rounds = 4;
++        core.cut_in = 3000;
++        var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 8 });
++        defer { host.closeAll(); host.stop(); }
++        host.admission_trace = try gpa.create(LaneHost.AdmissionTrace);
++        host.admission_trace.?.* = .{};
++        if (enabled) {
++            host.yield_trace = try gpa.create(yield_observation.Trace);
++            host.yield_trace.?.* = .{};
++        }
++        const cold: [4096]u32 = @splat(9);
++        const medium: [2049]u32 = @splat(8);
++        const small = [_]u32{ 1, 2, 3 };
++        const blocker: Request = .{ .prompt = &cold, .max_tokens = 20, .drafts = false };
++        const ordinary: Request = .{ .prompt = &medium, .max_tokens = 20, .drafts = false };
++        const tiny: Request = .{ .prompt = &small, .max_tokens = 32768, .drafts = false };
++        const sink: Sink = .{ .ctx = &target, .event = probe.event };
++        try host.engine().submit(1, &blocker, sink);
++        _ = host.admitOne();
++        const parent = host.filling.?;
++        try host.engine().submit(2, &ordinary, sink);
++        try host.engine().submit(3, &tiny, sink);
++        _ = host.admitOne();
++        try std.testing.expectEqual(parent, host.filling.?);
++        try std.testing.expectEqual(&parent.stream, core.filling.?);
++        try std.testing.expectEqual(@as(usize, 2), host.admitted.items.len);
++        try std.testing.expectEqual(@as(u64, 2), host.admitted.items[1].id);
++        try std.testing.expectEqual(@as(usize, 1), host.queued.items.len);
++        try std.testing.expectEqual(@as(u64, 3), host.queued.items[0].id);
++        try std.testing.expectEqual(@as(usize, @intFromBool(enabled)), Probe.calls);
++        if (host.yield_trace) |trace| {
++            try std.testing.expectEqual(@as(usize, 1), trace.len);
++            const row = trace.records[0];
++            try std.testing.expectEqual(@as(u64, 1), row.parent);
++            try std.testing.expectEqual(@as(usize, 0), row.runnable);
++            try std.testing.expectEqual(@as(u64, 2), row.selected);
++            try std.testing.expectEqual(@as(u64, 3), row.candidate);
++            try std.testing.expectEqual(@as(u32, 32768), row.max_new);
++            try std.testing.expectEqual(@as(usize, 34816), row.fit.wanted);
++            try std.testing.expectEqual(yield_observation.Fit.Status.fits, row.fit.status);
++            try std.testing.expectEqual(@as(usize, 1), row.candidate_index);
++        }
++    }
++}
++
++test "yield observation obeys retry wait priority and parked-fill guards" {
++    const probe = @import("cache_refresh_borrow_test.zig");
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 2 };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    core.fill_chunks = 1;
++    core.cut_in = 3000;
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 8 });
++    defer { host.closeAll(); host.stop(); }
++    host.admission_trace = try gpa.create(LaneHost.AdmissionTrace);
++    host.admission_trace.?.* = .{};
++    host.yield_trace = try gpa.create(yield_observation.Trace);
++    host.yield_trace.?.* = .{};
++    const cold: [4096]u32 = @splat(9);
++    const medium: [2049]u32 = @splat(8);
++    const blocker: Request = .{ .prompt = &cold, .max_tokens = 20, .drafts = false };
++    const ordinary: Request = .{ .prompt = &medium, .max_tokens = 20, .drafts = false };
++    var tiny: Request = .{ .prompt = &.{ 1, 2, 3 }, .max_tokens = 32768, .drafts = false };
++    const sink: Sink = .{ .ctx = &target, .event = probe.event };
++    try host.engine().submit(1, &blocker, sink);
++    _ = host.admitOne();
++    const parent = host.filling.?;
++    try host.engine().submit(2, &ordinary, sink);
++    try host.engine().submit(3, &tiny, sink);
++    const candidate = host.queued.items[1];
++    candidate.wait_for_fill = true;
++    _ = host.yieldChoice(0);
++    try std.testing.expectEqual(@as(usize, 0), host.yield_trace.?.len);
++    candidate.wait_for_fill = false;
++    candidate.full_wait = 0;
++    candidate.full_retry = std.math.maxInt(i96);
++    // No runnable stream yet: existing ContextFull retry becomes eligible when active drops to zero.
++    _ = host.yieldChoice(0);
++    try std.testing.expectEqual(@as(usize, 1), host.yield_trace.?.len);
++    host.yield_trace.?.* = .{};
++    candidate.full_wait = null;
++    tiny.background = true;
++    _ = host.yieldChoice(0);
++    try std.testing.expectEqual(@as(usize, 0), host.yield_trace.?.len);
++    tiny.background = false;
++    host.parked_fill = parent;
++    try std.testing.expect(!host.admitOne());
++    try std.testing.expectEqual(@as(usize, 0), host.yield_trace.?.len);
++    host.parked_fill = null;
++    host.info_.lanes = 1;
++    try std.testing.expect(!host.admitOne());
++    try std.testing.expectEqual(@as(usize, 0), host.yield_trace.?.len);
++    try std.testing.expectEqual(@as(usize, 2), host.queued.items.len);
++}
+diff --git a/zig/src/core/lanes/backend.zig b/zig/src/core/lanes/backend.zig
+index b7ef5b3c969d355cd7340e2194bc62d42d795980..bb6d7b9c2462ef480954d1975620b31c63a5bcee 100644
+--- a/zig/src/core/lanes/backend.zig
++++ b/zig/src/core/lanes/backend.zig
+@@ -3,6 +3,7 @@ const std = @import("std");
+ const Stream = @import("stream.zig").Stream;
+ const Shape = @import("shape.zig").Shape;
+ const Held = @import("stream.zig").Held;
++pub const yield_observation = @import("yield_observation.zig");
+ 
+ /// A token to feed: one the backend drew and holds (a handle), or a host value (forced or pending).
+ pub const Feed = union(enum) { handle: u64, value: u32 };
+@@ -47,6 +48,8 @@ pub const Backend = struct {
+     vtable: *const VTable,
+ 
+     pub const VTable = struct {
++        /// Optional read-only placement witness for a cold text prompt.
++        admission_fit: ?*const fn (ptr: *anyopaque, prompt: usize, max_new: u32) yield_observation.Fit = null,
+         /// Prefill the stream's prompt into its caches (and its draft head's).
+         prefill: *const fn (ptr: *anyopaque, s: *Stream) anyerror!void,
+         /// The same pass in pieces of at most `chunks` chunks, other streams' rounds between them; true once it is done.
+diff --git a/zig/src/core/lanes/yield_observation.zig b/zig/src/core/lanes/yield_observation.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..ed92013ac39c6593d04b16c3263e52475aaebf73
+--- /dev/null
++++ b/zig/src/core/lanes/yield_observation.zig
+@@ -0,0 +1,127 @@
++//! Bounded numeric witnesses. A positive fit needs no snapshot eviction.
++const std = @import("std");
++const admission = @import("admission_observation.zig");
++
++pub const short_prompt_limit = 2048;
++pub const scan_limit = 32;
++pub const protected_limit = 64;
++pub const snapshot_scan_limit = 256;
++pub const live_limit = 32;
++pub const record_limit = 256;
++pub const grid = 2048;
++
++pub const Fit = struct {
++    pub const Status = enum(u8) { unknown, fits, no_room, no_slot, too_long, too_many_states };
++    status: Status = .unknown,
++    pool: usize = 0,
++    wanted: usize = 0,
++    free: usize = 0,
++    largest: usize = 0,
++    live: usize = 0,
++    protected: usize = 0,
++    slots_free: usize = 0,
++};
++
++/// Conservative placement: preserve every supplied legacy snapshot, even if normal placement could retire it.
++pub fn placement(live: []const [2]usize, protected: []const [2]usize, context: usize, pool: usize,
++    prompt: usize, max_new: u32, round_rows: usize, slots_free: usize) Fit {
++    var out: Fit = .{ .pool = pool, .live = live.len, .protected = protected.len, .slots_free = slots_free };
++    const with_output = std.math.add(usize, prompt, max_new) catch return out;
++    const with_round = std.math.add(usize, with_output, round_rows) catch return out;
++    const raw = std.math.add(usize, with_round, 2) catch return out;
++    const padded = std.math.add(usize, raw, grid - 1) catch return out;
++    out.wanted = padded / grid * grid;
++    if (prompt == 0 or out.wanted > context or out.wanted > pool) {
++        out.status = .too_long;
++        return out;
++    }
++    if (slots_free == 0) {
++        out.status = .no_slot;
++        return out;
++    }
++    if (live.len > live_limit or protected.len > protected_limit) {
++        out.status = .too_many_states;
++        return out;
++    }
++    var used: [live_limit + protected_limit][2]usize = undefined;
++    @memcpy(used[0..live.len], live);
++    @memcpy(used[live.len..][0..protected.len], protected);
++    const measured = admission.measurePool(used[0 .. live.len + protected.len], pool, out.wanted, grid);
++    out.free = measured.free;
++    out.largest = measured.largest;
++    out.status = if (out.largest >= out.wanted) .fits else .no_room;
++    return out;
++}
++
++pub const Record = struct {
++    at: i96,
++    parent: u64,
++    runnable: usize,
++    selected: u64,
++    selected_prompt: usize,
++    candidate: u64,
++    candidate_index: usize,
++    prompt: usize,
++    max_new: u32,
++    age: u64,
++    fit: Fit,
++    probe_ns: u64,
++    total_ns: u64,
++};
++
++pub const Trace = struct {
++    records: [record_limit]Record = undefined,
++    len: usize = 0,
++    opportunities: u64 = 0,
++    scanned: u64 = 0,
++    scan_limited: u64 = 0,
++    no_candidate: u64 = 0,
++    dropped_opportunities: u64 = 0,
++    probe_ns: u64 = 0,
++    total_ns: u64 = 0,
++
++    pub fn push(t: *Trace, row: Record) void {
++        if (t.len == record_limit) {
++            t.dropped_opportunities +|= 1;
++            return;
++        }
++        t.records[t.len] = row;
++        t.len += 1;
++    }
++};
++
++test "yield observation full output reservation and fragmentation" {
++    const full = placement(&.{.{ 0, 752640 }}, &.{}, 524288, 786432, 61, 32768, 64, 4);
++    try std.testing.expectEqual(@as(usize, 34816), full.wanted);
++    try std.testing.expectEqual(Fit.Status.no_room, full.status);
++    const fits = placement(&.{.{ 0, 751616 }}, &.{}, 524288, 786432, 61, 32768, 64, 4);
++    try std.testing.expectEqual(Fit.Status.fits, fits.status);
++    const fragmented = placement(&.{ .{ 0, 16384 }, .{ 32768, 49152 }, .{ 65536, 786432 } }, &.{}, 524288, 786432, 61, 32768, 64, 4);
++    try std.testing.expectEqual(@as(usize, 32768), fragmented.free);
++    try std.testing.expectEqual(@as(usize, 16384), fragmented.largest);
++    try std.testing.expectEqual(Fit.Status.no_room, fragmented.status);
++}
++
++test "yield observation preserves snapshot rows and remains conservative" {
++    const live = [_][2]usize{.{ 0, 700416 }};
++    const kept = [_][2]usize{.{ 700416, 786432 }};
++    const a = placement(&live, &kept, 524288, 786432, 61, 32768, 64, 4);
++    try std.testing.expectEqual(Fit.Status.no_room, a.status);
++    try std.testing.expectEqual(@as(usize, 1), a.protected);
++    const b = placement(&live, &.{}, 524288, 786432, 61, 32768, 64, 4);
++    try std.testing.expectEqual(Fit.Status.fits, b.status);
++    try std.testing.expectEqual(@as(usize, 700416), kept[0][0]);
++    try std.testing.expectEqual(Fit.Status.no_slot, placement(&.{}, &.{}, 524288, 786432, 61, 32768, 64, 0).status);
++    try std.testing.expectEqual(Fit.Status.too_long, placement(&.{}, &.{}, 524288, 786432, 524288, 32768, 64, 1).status);
++    try std.testing.expectEqual(Fit.Status.unknown, placement(&.{}, &.{}, 524288, 786432, std.math.maxInt(usize), 32768, 64, 1).status);
++}
++
++test "yield observation records are bounded with explicit loss" {
++    var trace: Trace = .{};
++    const row: Record = .{ .at = 1, .parent = 1, .runnable = 0, .selected = 2, .selected_prompt = 8000,
++        .candidate = 3, .candidate_index = 1, .prompt = 61, .max_new = 32768,
++        .age = 3, .fit = .{}, .probe_ns = 0, .total_ns = 0 };
++    for (0..record_limit + 3) |_| trace.push(row);
++    try std.testing.expectEqual(@as(usize, record_limit), trace.len);
++    try std.testing.expectEqual(@as(u64, 3), trace.dropped_opportunities);
++}
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 2a4acb4db01403d4c98f887f6b4c42163d971102..634010348184fed6fc6a7d11dad664ca9a73c874 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -447,6 +447,7 @@ pub const Lanes = struct {
+ 
+     pub fn backend(self: *Lanes) be.Backend {
+         return .{ .ptr = self, .vtable = &.{
++            .admission_fit = admissionFitFn,
+             .prefill = prefillFn,
+             .prefill_part = prefillPartFn,
+             .first = firstFn,
+@@ -485,6 +486,32 @@ pub const Lanes = struct {
+         };
+     }
+ 
++    /// Read-only conservative fit. Does not reserve a slot, touch snapshots, or call GPU/peer APIs.
++    fn admissionFitFn(ptr: *anyopaque, prompt: usize, max_new: u32) be.yield_observation.Fit {
++        const self = of(ptr);
++        const observation = be.yield_observation;
++        if (self.snaps.items.len > observation.snapshot_scan_limit) return .{ .status = .too_many_states, .pool = self.m.pool_cap };
++        var live: [observation.live_limit][2]usize = undefined;
++        var count: usize = 0;
++        var it = self.streams.valueIterator();
++        while (it.next()) |entry| {
++            if (count == live.len) return .{ .status = .too_many_states };
++            live[count] = .{ entry.base, entry.end };
++            count += 1;
++        }
++        var protected: [observation.protected_limit][2]usize = undefined;
++        var kept: usize = 0;
++        for (self.snaps.items) |sn| if (!sn.backed and !sn.stale) {
++            if (kept == protected.len) return .{ .status = .too_many_states };
++            protected[kept] = .{ sn.base, sn.base + sn.at };
++            kept += 1;
++        };
++        var slots_free: usize = 0;
++        for (self.used[0..self.m.streams]) |used| slots_free += @intFromBool(!used);
++        return observation.placement(live[0..count], protected[0..kept], self.m.context_cap,
++            self.m.pool_cap, prompt, max_new, self.m.eng.round_rows, slots_free);
++    }
++
+     fn of(ptr: *anyopaque) *Lanes {
+         return @ptrCast(@alignCast(ptr));
+     }
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index c86c5088cfe98bba450a24393555e01768866a8c..229141e941db8beaef945ee3898cf781c7a1d585 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -218,10 +218,16 @@ const Host = struct {
+         return x.lone.?(x.family, s, hooks.ctx, hooks.committed, hooks.yield);
+     }
+ 
+-    /// The family's backend, each call made with the context current on the calling thread.
++    /// The family's backend. GPU operations need the context current on the calling thread.
+     fn backend(h: *Host) lanes.backend.Backend {
+         const v = h.inner.vtable;
+         h.vtable = .{
++            .admission_fit = if (v.admission_fit != null) struct {
++                fn f(p: *anyopaque, prompt: usize, max_new: u32) lanes.backend.yield_observation.Fit {
++                    const x: *Host = @ptrCast(@alignCast(p));
++                    return x.inner.vtable.admission_fit.?(x.inner.ptr, prompt, max_new);
++                }
++            }.f else null,
+             .prefill = struct {
+                 fn f(p: *anyopaque, s: *lanes.Stream) anyerror!void {
+                     const x = bind(p);
+@@ -465,6 +471,40 @@ test "context windows: the family default inside the model's, 0 for the model's,
+     try std.testing.expectError(error.NoNative, contextWindow(0, 0, 16384));
+ }
+ 
++test "native host forwards the optional admission fit to the inner backend" {
++    const Fit = lanes.backend.yield_observation.Fit;
++    const Probe = struct {
++        var receiver: ?*anyopaque = null;
++        var prompt_seen: usize = 0;
++        var max_new_seen: u32 = 0;
++        const result: Fit = .{ .status = .fits, .pool = 786432, .wanted = 4096, .free = 8192, .largest = 6144, .live = 2, .protected = 1, .slots_free = 5 };
++
++        fn fit(ptr: *anyopaque, prompt: usize, max_new: u32) Fit {
++            receiver = ptr;
++            prompt_seen = prompt;
++            max_new_seen = max_new;
++            return result;
++        }
++    };
++    var target: lanes.fake.Fake = .{ .gpa = std.testing.allocator };
++    defer target.deinit();
++    var host: Host = undefined;
++    host.gpu = null;
++    host.family = &host;
++    host.inner = target.backend();
++    try std.testing.expect(host.backend().vtable.admission_fit == null);
++
++    var table = host.inner.vtable.*;
++    table.admission_fit = Probe.fit;
++    host.inner.vtable = &table;
++    const wrapped = host.backend();
++    const fit = wrapped.vtable.admission_fit orelse return error.MissingAdmissionFit;
++    try std.testing.expectEqual(Probe.result, fit(wrapped.ptr, 1194, 2400));
++    try std.testing.expect(Probe.receiver == host.inner.ptr);
++    try std.testing.expectEqual(@as(usize, 1194), Probe.prompt_seen);
++    try std.testing.expectEqual(@as(u32, 2400), Probe.max_new_seen);
++}
++
+ test "a cancel during a long prompt stops it, and the next request's reply is unchanged (#291)" {
+     const gpa = std.testing.allocator;
+     var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 10 };
