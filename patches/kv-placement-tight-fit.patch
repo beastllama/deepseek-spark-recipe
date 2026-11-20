@@ -1,0 +1,73 @@
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -239,6 +239,7 @@
+ /// The growth, tail and rows first fits, preferring one that leaves another same-size fit clear of live and kept rows.
+ /// If none leaves that room, keep the original first feasible choice; never refuse an otherwise fitting admission.
+ pub fn placeSoft(gpa: std.mem.Allocator, live: []const [2]usize, kept: []const [3]usize, size: usize, cap: usize) !?usize {
++    if (kept.len == 0) return placeTight(live, size, cap);
+     var used: std.ArrayList([2]usize) = .empty;
+     defer used.deinit(gpa);
+     try used.appendSlice(gpa, live);
+@@ -257,6 +258,61 @@
+         if (roomAfter(gpa, used.items, b, size, cap) catch false) return b;
+     };
+     return first;
++}
++
++/// Pack a new extent into the smallest fitting aligned gap. Live extents need not be sorted.
++fn placeTight(live: []const [2]usize, size: usize, cap: usize) ?usize {
++    if (size == 0) return place(live, size, cap);
++    var best: ?usize = null;
++    var best_gap = cap;
++    // Every aligned free gap starts at zero or at an aligned live end.
++    for (0..live.len + 1) |i| {
++        const past = if (i == 0) 0 else live[i - 1][1];
++        if (past > cap) continue;
++        const padding = (model.chunk_rows - past % model.chunk_rows) % model.chunk_rows;
++        if (padding > cap - past) continue;
++        const base = past + padding;
++        if (size > cap - base) continue;
++
++        var end = cap;
++        for (live) |u| {
++            if (u[1] > base and u[0] < u[1]) end = @min(end, @max(base, u[0]));
++        }
++        const gap = end - base;
++        if (gap >= size and (best == null or gap < best_gap or (gap == best_gap and base < best.?))) {
++            best = base;
++            best_gap = gap;
++        }
++    }
++    return best;
++}
++
++test "tight live placement preserves a larger gap for the next full reservation" {
++    const c = model.chunk_rows;
++    const cap = 384 * c;
++    const small = 67 * c;
++    const large = 105 * c;
++    const live = [_][2]usize{ .{ 112 * c, 176 * c }, .{ 264 * c, 384 * c } };
++    const old = place(&live, small, cap).?;
++    try std.testing.expectEqual(@as(usize, 0), old);
++    try std.testing.expectEqual(@as(?usize, null), place(&(live ++ [_][2]usize{.{ old, old + small }}), large, cap));
++
++    const gpa = std.testing.allocator;
++    const small_base = (try placeSoft(gpa, &live, &.{}, small, cap)).?;
++    try std.testing.expectEqual(@as(usize, 176 * c), small_base);
++    const occupied = live ++ [_][2]usize{.{ small_base, small_base + small }};
++    try std.testing.expectEqual(@as(?usize, 0), try placeSoft(gpa, &occupied, &.{}, large, cap));
++}
++
++test "tight live placement respects alignment, ties and occupied rows" {
++    const c = model.chunk_rows;
++    const cap = 13 * c;
++    const used = [_][2]usize{ .{ 9 * c, 13 * c }, .{ 4 * c, 5 * c - 1 } };
++    const gpa = std.testing.allocator;
++    try std.testing.expectEqual(@as(?usize, 0), try placeSoft(gpa, &used, &.{}, 3 * c, cap));
++    try std.testing.expectEqual(@as(?usize, 5 * c), try placeSoft(gpa, &(used ++ [_][2]usize{.{ 0, c }}), &.{}, 4 * c, cap));
++    try std.testing.expectEqual(@as(?usize, null), try placeSoft(gpa, &used, &.{}, 5 * c, cap));
++    try std.testing.expectEqual(@as(?usize, 0), try placeSoft(gpa, &.{}, &.{}, cap, cap));
+ }
+ 
+ test "a placement leaves a kept state room to grow while one fits so" {
