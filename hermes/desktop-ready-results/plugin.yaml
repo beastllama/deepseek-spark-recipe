@@ -1,0 +1,5 @@
+name: desktop-ready-results
+version: "1.0.0"
+description: "Show completed child findings when their Hermes Desktop parent checks its subagents."
+provides_hooks:
+  - transform_tool_result

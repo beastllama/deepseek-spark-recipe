@@ -1,5 +1,7 @@
 # DeepSeek on two DGX Sparks: measured stack and reproduction recipe
 
+**November 19 Hermes Desktop update.** On a recorded swarm, the parent checked after three children had finished and received zero findings. Replaying that same check with the installed plugin returned all three, 37m 02s before the full reports originally arrived. Total project time saved is still unmeasured. [Plugin, evidence and installation](hermes/desktop-ready-results/README.md).
+
 **November 19 KV placement experiment.** The blocked request queued for 57.0 s versus 208.3 s, with all seven reply token hashes and cache counts matching. The full SparkDash job took 4.8 s longer. The original allocator remains selected. [Patch, measurements, and tradeoffs](KV-PLACEMENT-TRIAL.md).
 
 **November 17 short-request scheduling.** A 61-token cold request queued for 1.96 s versus 10.52 s on the same eight-lane, 786,432-position pool. Its output token sequence matched. The five-job wave finished in 34.81 s versus 41.32 s with 17% fewer output tokens overall. [Source, reproduction steps and tradeoffs](BOUNDED-SHORT-ADMISSION.md).
