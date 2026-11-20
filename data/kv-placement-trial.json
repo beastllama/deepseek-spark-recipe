@@ -1,0 +1,189 @@
+{
+  "date": "2026-11-19",
+  "status": "experimental trial; original selected after comparison",
+  "runs_per_arm": 1,
+  "hardware": "2x NVIDIA DGX Spark TP2",
+  "sparkdash": "2.90.1 with local KV placement collector",
+  "settings": {
+    "checkpoint": "Mia EAQ v1 with matching abliterated Keys",
+    "reasoning": "high",
+    "temperature": 0.7,
+    "top_k": 20,
+    "context": 524288,
+    "kv_pool": 786432,
+    "output_limit": 32768,
+    "primer_output_limit": 8,
+    "snapshot_gib": 1,
+    "lanes": 8
+  },
+  "scope": {
+    "measured_requests_per_arm": 6,
+    "primer_requests_per_arm": 1,
+    "matching_reply_token_hashes": 7,
+    "matching_cache_counts": 7,
+    "outside_requests": 0,
+    "observed_disconnects": 0,
+    "observed_ooms": 0
+  },
+  "source": {
+    "file": "zig/src/families/dsv41/lanes.zig",
+    "original_sha256": "9d5740dbb24af9ece40c41809b9d3b621fb75fd5eba7867feca475280d4b498f",
+    "candidate_sha256": "30db3f8bcb478e81059260672e20fb323df3976e1a572da43772f6df57ee4123",
+    "patch_sha256": "6169094ac3c14e0a29225b8e346f3b412dee8930bd34f60027fcede4968ce9fe",
+    "original_closure_sha256": "89dd98ff5d624e8f47bc8d7bcbcd1488edf84ecd0222468373e738085481d665",
+    "candidate_closure_sha256": "bc17a32c6608d543e605005e0a4ab08f27e27b96584259aaee333d2d2722f017",
+    "unchanged_gpu_fatbins": 21
+  },
+  "arms": {
+    "original": {
+      "job_ms": 838518,
+      "wave_ms": 798060.734,
+      "output_tokens": 69863,
+      "cold_request_ms": 208825.52,
+      "q_queue_ms": 208257.295,
+      "q_total_ms": 272357.83,
+      "q_context_retry_ms": 150936.064,
+      "q_cached_cut_in_ineligible_ms": 56605.305,
+      "q_fragmentation_failures": 146,
+      "q_admission_geometry": {
+        "wanted": 215040,
+        "free": 272384,
+        "largest": 180224,
+        "live": 3
+      },
+      "requests": [
+        {
+          "role": "prime",
+          "prompt_tokens": 94260,
+          "cached_tokens": 0,
+          "queue_ms": 0.126,
+          "completion_ms": 40447.45,
+          "output_tokens": 8
+        },
+        {
+          "role": "A",
+          "prompt_tokens": 195489,
+          "cached_tokens": 94080,
+          "queue_ms": 0.1,
+          "completion_ms": 318839.22,
+          "output_tokens": 6562
+        },
+        {
+          "role": "B",
+          "prompt_tokens": 97191,
+          "cached_tokens": 94080,
+          "queue_ms": 5.222,
+          "completion_ms": 749931.87,
+          "output_tokens": 31647
+        },
+        {
+          "role": "C",
+          "prompt_tokens": 146334,
+          "cached_tokens": 94080,
+          "queue_ms": 12.789,
+          "completion_ms": 251386.75,
+          "output_tokens": 6697
+        },
+        {
+          "role": "D",
+          "prompt_tokens": 211879,
+          "cached_tokens": 94080,
+          "queue_ms": 7.391,
+          "completion_ms": 589609.51,
+          "output_tokens": 17314
+        },
+        {
+          "role": "P",
+          "prompt_tokens": 103312,
+          "cached_tokens": 0,
+          "queue_ms": 30.882,
+          "completion_ms": 208825.52,
+          "output_tokens": 7318
+        },
+        {
+          "role": "Q",
+          "prompt_tokens": 181142,
+          "cached_tokens": 94080,
+          "queue_ms": 208257.295,
+          "completion_ms": 272357.83,
+          "output_tokens": 325
+        }
+      ]
+    },
+    "candidate": {
+      "job_ms": 843329,
+      "wave_ms": 803082.931,
+      "output_tokens": 69863,
+      "cold_request_ms": 254693.79,
+      "q_queue_ms": 57003.858,
+      "q_total_ms": 127105.35,
+      "q_context_retry_ms": 0.0,
+      "q_cached_cut_in_ineligible_ms": 56292.928,
+      "q_fragmentation_failures": 0,
+      "q_admission_geometry": {
+        "wanted": 215040,
+        "free": 272384,
+        "largest": 229376,
+        "live": 3
+      },
+      "requests": [
+        {
+          "role": "prime",
+          "prompt_tokens": 94260,
+          "cached_tokens": 0,
+          "queue_ms": 0.121,
+          "completion_ms": 40230.42,
+          "output_tokens": 8
+        },
+        {
+          "role": "A",
+          "prompt_tokens": 195489,
+          "cached_tokens": 94080,
+          "queue_ms": 0.141,
+          "completion_ms": 319408.75,
+          "output_tokens": 6562
+        },
+        {
+          "role": "B",
+          "prompt_tokens": 97191,
+          "cached_tokens": 94080,
+          "queue_ms": 41.319,
+          "completion_ms": 755293.5,
+          "output_tokens": 31647
+        },
+        {
+          "role": "C",
+          "prompt_tokens": 146334,
+          "cached_tokens": 94080,
+          "queue_ms": 43.124,
+          "completion_ms": 253168.21,
+          "output_tokens": 6697
+        },
+        {
+          "role": "D",
+          "prompt_tokens": 211879,
+          "cached_tokens": 94080,
+          "queue_ms": 62.266,
+          "completion_ms": 593987.07,
+          "output_tokens": 17314
+        },
+        {
+          "role": "P",
+          "prompt_tokens": 103312,
+          "cached_tokens": 0,
+          "queue_ms": 28.772,
+          "completion_ms": 254693.79,
+          "output_tokens": 7318
+        },
+        {
+          "role": "Q",
+          "prompt_tokens": 181142,
+          "cached_tokens": 94080,
+          "queue_ms": 57003.858,
+          "completion_ms": 127105.35,
+          "output_tokens": 325
+        }
+      ]
+    }
+  }
+}
